@@ -3,46 +3,56 @@ from typing import List, Tuple, Dict
 
 class RadixNode:
     def __init__(self):
-        self.key: Tuple[int, ...] = ()
-        self.children: Dict[int, 'RadixNode'] = {}
-        self.block_table: List[int] = []
+        self.children: Dict[Tuple[int, ...], 'RadixNode'] = {}
+        self.block_id: int = -1
         self.last_access_time: float = time.time()
-        self.ref_counter: int = 0
 
 class RadixCache:
-    def __init__(self):
+    def __init__(self, block_size: int):
         self.root = RadixNode()
+        self.block_size = block_size
 
     def match_prefix(self, tokens: List[int]) -> Tuple[List[int], List[int]]:
-        """
-        Walks the trie to find the longest matching prefix.
-        Returns: (matched_tokens, matched_block_indices)
-        """
         node = self.root
-        i = 0
+        matched_tokens = []
         matched_blocks = []
         
-        while i < len(tokens):
-            token = tokens[i]
-            if token not in node.children:
+        for i in range(0, len(tokens), self.block_size):
+            chunk = tuple(tokens[i : i + self.block_size])
+            
+            if len(chunk) < self.block_size:
                 break
                 
-            child = node.children[token]
-            prefix_len = len(child.key)
-            
-            if tuple(tokens[i:i+prefix_len]) == child.key:
-                matched_blocks.extend(child.block_table)
-                child.last_access_time = time.time()
-                child.ref_counter += 1
-                node = child
-                i += prefix_len
+            if chunk in node.children:
+                node = node.children[chunk]
+                node.last_access_time = time.time()
+                matched_tokens.extend(chunk)
+                matched_blocks.append(node.block_id)
             else:
                 break
                 
-        return tokens[:i], matched_blocks
+        return matched_tokens, matched_blocks
 
-    def insert(self, tokens: List[int], block_table: List[int]):
-        """
-        Inserts a completed sequence into the radix tree for future reuse.
-        """
-        pass
+    def insert(self, tokens: List[int], block_table: List[int]) -> List[int]:
+        node = self.root
+        newly_inserted_blocks = []
+        
+        for i, block_id in enumerate(block_table):
+            start_idx = i * self.block_size
+            end_idx = start_idx + self.block_size
+            
+            if end_idx > len(tokens):
+                break
+                
+            chunk = tuple(tokens[start_idx:end_idx])
+            
+            if chunk not in node.children:
+                new_node = RadixNode()
+                new_node.block_id = block_id
+                node.children[chunk] = new_node
+                newly_inserted_blocks.append(block_id)
+                
+            node = node.children[chunk]
+            node.last_access_time = time.time()
+            
+        return newly_inserted_blocks

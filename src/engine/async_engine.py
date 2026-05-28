@@ -2,9 +2,8 @@ import asyncio
 import math
 import time
 import torch
-
 from typing import Optional
-
+from engine.radix_cache import RadixCache
 from engine.request import InferenceRequest
 from engine.sequence import Sequence
 from engine.scheduler import Scheduler
@@ -29,14 +28,16 @@ class AsyncInferenceEngine:
     ):
         self.model = model
         self.tokenizer = tokenizer
-
         self.scheduler = Scheduler(
             max_batch_size=max_batch_size
         )
-
         config = model.config
 
         self.block_size = 16
+
+        self.radix_cache = RadixCache(
+            block_size=self.block_size
+        )
 
         self.num_layers = config.num_hidden_layers
         self.num_qo_heads = config.num_attention_heads
@@ -80,7 +81,6 @@ class AsyncInferenceEngine:
         self.metrics_task = asyncio.create_task(
             self._log_system_metrics()
         )
-
     async def add_request(
         self,
         request: InferenceRequest,
@@ -94,6 +94,12 @@ class AsyncInferenceEngine:
             prompt_token_ids=prompt_ids,
             eos_token_id=self.tokenizer.eos_token_id,
         )
+
+        matched_tokens, matched_blocks = self.radix_cache.match_prefix(prompt_ids)
+        seq.block_table = list(matched_blocks)
+        seq.cached_prefix_len = len(matched_tokens)
+        
+        self.cached_prompt_tokens += len(matched_tokens)
 
         seq.prev_text = self.tokenizer.decode(
             prompt_ids,
@@ -140,7 +146,7 @@ class AsyncInferenceEngine:
                             seq.finish_time = time.time()
                             self._calculate_and_log_request_metrics(seq)
                             
-                            self.allocator.free(seq.block_table)
+                            self.allocator.decref(seq.block_table)
                             seq.block_table.clear()
                             
                             await seq.request.finish()
@@ -174,18 +180,19 @@ class AsyncInferenceEngine:
         self,
         seq: Sequence,
     ):
-        needed = math.ceil(
+        logical_blocks = math.ceil(
             seq.get_len / self.block_size
         )
 
-        current = len(seq.block_table)
+        current_blocks = len(seq.block_table)
 
-        if needed > current:
-            blocks = self.allocator.allocate(
-                needed - current
+        if logical_blocks > current_blocks:
+            new_blocks = self.allocator.allocate(
+                logical_blocks - current_blocks
             )
 
-            seq.block_table.extend(blocks)
+            seq.block_table.extend(new_blocks)
+
 
     @torch.inference_mode()
     def _pytorch_step(self):
@@ -217,8 +224,10 @@ class AsyncInferenceEngine:
                 device=self.model.device,
             )
 
+            total_len = len(seq.prompt_token_ids)
+
             last_len = (
-                seq.get_len %
+                total_len %
                 self.block_size
             )
 
@@ -233,7 +242,7 @@ class AsyncInferenceEngine:
             )
 
             qo_indptr = torch.tensor(
-                [0, seq.get_len],
+                [0, len(seq.uncached_token_ids)],
                 dtype=torch.int32,
                 device=self.model.device,
             )
@@ -241,7 +250,7 @@ class AsyncInferenceEngine:
             build_batch_indices_positions(
                 qo_indptr,
                 torch.tensor(
-                    [seq.get_len],
+                    [len(seq.uncached_token_ids)],
                     dtype=torch.int32,
                     device=self.model.device,
                 ),
@@ -258,12 +267,20 @@ class AsyncInferenceEngine:
             )
 
             input_ids = torch.tensor(
-                [seq.prompt_token_ids],
+                [seq.uncached_token_ids],
                 device=self.model.device,
             )
 
+            prefix_len = seq.cached_prefix_len
+            position_ids = torch.arange(
+                prefix_len,
+                prefix_len + len(seq.uncached_token_ids),
+                device=self.model.device,
+            ).unsqueeze(0)
+
             out = self.model(
                 input_ids=input_ids,
+                position_ids=position_ids,
                 use_cache=False,
             )
 
@@ -294,6 +311,18 @@ class AsyncInferenceEngine:
             seq.prev_text = full_text
 
             outputs.append((seq, delta))
+        
+        if prefill_seqs:
+            for seq in prefill_seqs:
+                full_blocks = ( len(seq.prompt_token_ids) // self.block_size )
+
+                if full_blocks > 0:
+                    newly_cached = self.radix_cache.insert(
+                        seq.prompt_token_ids[:full_blocks * self.block_size],
+                        seq.block_table[:full_blocks],
+                    )
+                    if newly_cached:
+                        self.allocator.incref(newly_cached)
 
         if decode_seqs:
             for seq in decode_seqs:
