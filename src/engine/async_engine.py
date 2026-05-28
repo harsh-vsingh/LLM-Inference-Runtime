@@ -5,15 +5,20 @@ from typing import Optional
 from engine.request import InferenceRequest
 from engine.sequence import Sequence, SequenceStatus
 from engine.scheduler import Scheduler
+from engine.kv_cache import RadixCache
 
 class AsyncInferenceEngine:
     def __init__(self, model, tokenizer, max_batch_size: int = 4):
         self.model = model
         self.tokenizer = tokenizer
         self.scheduler = Scheduler(max_batch_size=max_batch_size)
+        self.radix_cache = RadixCache()
         self.wakeup_event = asyncio.Event()
         self.background_task: Optional[asyncio.Task] = None
         self.metrics_task: Optional[asyncio.Task] = None
+        
+        self.total_prefill_tokens = 0
+        self.cached_prefill_tokens = 0
 
     def start(self):
         self.background_task = asyncio.create_task(self._process_loop())
@@ -34,32 +39,51 @@ class AsyncInferenceEngine:
     async def _log_system_metrics(self):
         while True:
             await asyncio.sleep(5)
-            if self.scheduler.has_unfinished_sequences():
+            if self.scheduler.has_unfinished_sequences() or self.total_prefill_tokens > 0:
                 active_batch = len(self.scheduler.running)
                 waiting_queue = len(self.scheduler.waiting)
                 
                 mem_alloc = torch.cuda.memory_allocated() / (1024**3)
                 mem_res = torch.cuda.memory_reserved() / (1024**3)
                 
+                hit_rate = 0.0
+                if self.total_prefill_tokens > 0:
+                    hit_rate = (self.cached_prefill_tokens / self.total_prefill_tokens) * 100
+                
                 print(f"[METRICS] Batch Size: {active_batch}/{self.scheduler.max_batch_size} | "
                       f"Queue: {waiting_queue} | "
                       f"GPU VRAM: Allc {mem_alloc:.2f}GB, Rsvd {mem_res:.2f}GB | "
-                      f"Cache Hit Rate: 0.0% (Pending Phase 5)")
+                      f"Cache Hit Rate: {hit_rate:.1f}% ({self.cached_prefill_tokens}/{self.total_prefill_tokens} tokens)")
 
     async def _process_loop(self):
         while True:
             await self.wakeup_event.wait()
             
             while self.scheduler.has_unfinished_sequences():
-                step_outputs = await asyncio.to_thread(self._pytorch_step)
-                
-                for seq, new_text in step_outputs:
-                    await seq.request.put_token(new_text)
+                try:
+                    step_outputs = await asyncio.to_thread(self._pytorch_step)
                     
-                    if seq.is_finished():
-                        seq.finish_time = time.time()
-                        self._calculate_and_log_request_metrics(seq)
+                    for seq, new_text in step_outputs:
+                        await seq.request.put_token(new_text)
+                        
+                        if seq.is_finished():
+                            seq.finish_time = time.time()
+                            self._calculate_and_log_request_metrics(seq)
+                            
+                            full_ids = seq.prompt_token_ids + seq.generated_token_ids
+                            self.radix_cache.insert(full_ids, seq.past_key_values)
+                            
+                            await seq.request.finish()
+                            
+                except Exception as e:
+                    import traceback
+                    print(f"\n[ENGINE CRASH] PyTorch step failed: {e}")
+                    traceback.print_exc()
+                    
+                    for seq in self.scheduler.running:
                         await seq.request.finish()
+                    self.scheduler.running.clear()
+                    break
                         
                 await asyncio.sleep(0)
                 
@@ -86,6 +110,7 @@ class AsyncInferenceEngine:
 
     @torch.inference_mode()
     def _pytorch_step(self):
+
         now = time.time()
         for seq in self.scheduler.running:
             if seq.start_time == 0.0:
@@ -95,8 +120,24 @@ class AsyncInferenceEngine:
         outputs = []
 
         for seq in prefill_seqs:
-            input_ids = torch.tensor([seq.prompt_token_ids], device=self.model.device)
-            out = self.model(input_ids=input_ids, use_cache=True)
+            full_prompt_ids = seq.prompt_token_ids
+            self.total_prefill_tokens += len(full_prompt_ids)
+            
+            match_len, matched_kv = self.radix_cache.match_prefix(full_prompt_ids)
+            
+            if match_len == len(full_prompt_ids):
+                match_len = len(full_prompt_ids) - 1
+                matched_kv = self.radix_cache._slice_kv_cache(matched_kv, match_len)
+
+            if match_len > 0:
+                self.cached_prefill_tokens += match_len
+                unmatched_ids = full_prompt_ids[match_len:]
+                input_ids = torch.tensor([unmatched_ids], device=self.model.device)
+                out = self.model(input_ids=input_ids, past_key_values=matched_kv, use_cache=True)
+            else:
+                input_ids = torch.tensor([full_prompt_ids], device=self.model.device)
+                out = self.model(input_ids=input_ids, use_cache=True)
+            
             next_token_id = int(torch.argmax(out.logits[0, -1, :], dim=-1).item())
             
             seq.past_key_values = out.past_key_values
