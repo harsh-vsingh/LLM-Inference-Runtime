@@ -5,6 +5,9 @@ from api.routes import router
 from models.loader import get_model_loader
 from engine.async_engine import AsyncInferenceEngine
 
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="bitsandbytes.*")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     model_name = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
