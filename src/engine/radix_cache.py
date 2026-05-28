@@ -1,28 +1,34 @@
 import time
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
+
 
 class RadixNode:
     def __init__(self):
-        self.children: Dict[Tuple[int, ...], 'RadixNode'] = {}
+        self.children: Dict[Tuple[int, ...], "RadixNode"] = {}
         self.block_id: int = -1
+
+        self.parent: Optional["RadixNode"] = None
+        self.chunk: Optional[Tuple[int, ...]] = None
+
         self.last_access_time: float = time.time()
+
 
 class RadixCache:
     def __init__(self, block_size: int):
         self.root = RadixNode()
         self.block_size = block_size
 
-    def match_prefix(self, tokens: List[int]) -> Tuple[List[int], List[int]]:
+    def match_prefix(
+        self,
+        tokens: List[int],
+    ) -> Tuple[List[int], List[int]]:
         node = self.root
         matched_tokens = []
         matched_blocks = []
-        
+
         for i in range(0, len(tokens), self.block_size):
             chunk = tuple(tokens[i : i + self.block_size])
-            
-            if len(chunk) < self.block_size:
-                break
-                
+
             if chunk in node.children:
                 node = node.children[chunk]
                 node.last_access_time = time.time()
@@ -30,29 +36,81 @@ class RadixCache:
                 matched_blocks.append(node.block_id)
             else:
                 break
-                
+
         return matched_tokens, matched_blocks
 
-    def insert(self, tokens: List[int], block_table: List[int]) -> List[int]:
+    def insert(
+        self,
+        tokens: List[int],
+        block_table: List[int],
+    ) -> List[int]:
         node = self.root
-        newly_inserted_blocks = []
-        
+        newly_inserted = []
+
         for i, block_id in enumerate(block_table):
-            start_idx = i * self.block_size
-            end_idx = start_idx + self.block_size
-            
-            if end_idx > len(tokens):
-                break
-                
-            chunk = tuple(tokens[start_idx:end_idx])
-            
+            start = i * self.block_size
+            end = min(start + self.block_size, len(tokens))
+
+            chunk = tuple(tokens[start:end])
+
             if chunk not in node.children:
-                new_node = RadixNode()
-                new_node.block_id = block_id
-                node.children[chunk] = new_node
-                newly_inserted_blocks.append(block_id)
+                child = RadixNode()
+                child.block_id = block_id
+                child.parent = node
+                child.chunk = chunk
+                node.children[chunk] = child
                 
+                newly_inserted.append(block_id)
+
             node = node.children[chunk]
             node.last_access_time = time.time()
             
-        return newly_inserted_blocks
+        return newly_inserted
+
+    def _collect_leaf_nodes(
+        self,
+        node: Optional[RadixNode] = None,
+        leaves: Optional[List[RadixNode]] = None,
+    ):
+        if node is None:
+            node = self.root
+
+        if leaves is None:
+            leaves = []
+
+        if node is not self.root and not node.children:
+            leaves.append(node)
+
+        for child in node.children.values():
+            self._collect_leaf_nodes(child, leaves)
+
+        return leaves
+
+    def evict_lru(
+        self,
+        num_blocks: int,
+        ref_counts: List[int],
+    ) -> List[int]:
+        leaves = self._collect_leaf_nodes()
+
+        if not leaves:
+            return []
+
+        leaves.sort(key=lambda x: x.last_access_time)
+        evicted = []
+
+        for leaf in leaves:
+            if len(evicted) >= num_blocks:
+                break
+
+            # ONLY evict if the cache is the ONLY owner (ref_count == 1)
+            if ref_counts[leaf.block_id] > 1:
+                continue
+
+            evicted.append(leaf.block_id)
+
+            parent = leaf.parent
+            if parent is not None and leaf.chunk is not None:
+                del parent.children[leaf.chunk]
+
+        return evicted
