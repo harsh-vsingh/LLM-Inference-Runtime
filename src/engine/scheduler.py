@@ -2,11 +2,14 @@ from typing import List, Tuple
 from engine.sequence import Sequence, SequenceStatus
 
 class Scheduler:
-    def __init__(self, max_num_batched_tokens: int = 4096, max_num_seqs: int = 256):
+    max_batch_size: int
+
+    def __init__(self, max_num_batched_tokens: int = 4096, max_num_seqs: int = 256, max_batch_size: int = 4):
         self.waiting: List[Sequence] = []
         self.running: List[Sequence] = []
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_num_seqs = max_num_seqs
+        self.max_batch_size = max_batch_size
 
     def add_sequence(self, seq: Sequence):
         self.waiting.append(seq)

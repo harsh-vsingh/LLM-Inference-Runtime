@@ -39,6 +39,10 @@ class RadixCache:
 
         return matched_tokens, matched_blocks
 
+    def reset(self):
+        """Clears the cache for benchmarking A/B tests."""
+        self.root = RadixNode()
+
     def insert(
         self,
         tokens: List[int],

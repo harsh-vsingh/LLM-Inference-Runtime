@@ -9,12 +9,12 @@ from engine.request import InferenceRequest
 from engine.sequence import Sequence
 from engine.scheduler import Scheduler
 from engine.memory import BlockAllocator
-
 from models.llama import (
     init_flashinfer_state,
     patch_llama_model,
     plan_prefill,
     plan_decode,
+    FlashInferState, 
     build_batch_indices_positions,
 )
 
@@ -30,6 +30,12 @@ class AsyncInferenceEngine:
         self.model = model
         self.tokenizer = tokenizer
 
+        self.config = {
+                    "ENABLE_CONTINUOUS_BATCHING": True,
+                    "ENABLE_CHUNKED_PREFILL": True,
+                    "ENABLE_PREFIX_CACHE": True,
+                }
+        
         self.scheduler = Scheduler(max_num_batched_tokens=max_num_batched_tokens, max_num_seqs=max_num_seqs)
 
         config = model.config
@@ -81,19 +87,23 @@ class AsyncInferenceEngine:
         prompt_ids = self.tokenizer(request.prompt).input_ids
         self.total_prompt_tokens += len(prompt_ids)
 
-
         seq = Sequence(
             request=request,
             prompt_token_ids=prompt_ids,
             eos_token_id=self.tokenizer.eos_token_id,
         )
 
-        matched_tokens, matched_blocks = self.radix_cache.match_prefix(prompt_ids)
-
-
-        if len(matched_tokens) == len(prompt_ids) and len(matched_blocks) > 0:
-            matched_tokens = matched_tokens[:-self.block_size]
-            matched_blocks = matched_blocks[:-1]
+        matched_tokens, matched_blocks = [], []
+        
+        if self.config["ENABLE_PREFIX_CACHE"]:
+            matched_tokens, matched_blocks = self.radix_cache.match_prefix(prompt_ids)
+            
+            request.metrics["prefix_depth_tokens"] = len(matched_tokens)
+            request.metrics["cache_blocks_reused"] = len(matched_blocks)
+            
+            if len(matched_tokens) == len(prompt_ids) and len(matched_blocks) > 0:
+                matched_tokens = matched_tokens[:-self.block_size]
+                matched_blocks = matched_blocks[:-1]
 
         seq.cached_prefix_len = len(matched_tokens)
         seq.computed_len = seq.cached_prefix_len
@@ -201,16 +211,20 @@ class AsyncInferenceEngine:
             self.wakeup_event.clear()
 
     def _calculate_and_log_request_metrics(self, seq: Sequence):
-        queue_latency = seq.start_time - seq.arrival_time
-        ttft = seq.first_token_time - seq.arrival_time
-        num_generated = len(seq.generated_token_ids)
+        m = seq.request.metrics
+        now = time.time() 
+
+        queue_latency = max(0.0, m["admitted_at"] - m["created_at"])
+        ttft = max(0.0, m["first_token_time"] - m["created_at"])
+        num_generated = m["tokens_generated"]
 
         if num_generated > 1:
-            tpot = (seq.finish_time - seq.first_token_time) / (num_generated - 1)
+            tpot = (now - m["first_token_time"]) / (num_generated - 1)
         else:
             tpot = 0.0
 
-        throughput = num_generated / max(seq.finish_time - seq.start_time, 1e-6)
+        total_time = max(now - m["created_at"], 0.01)
+        throughput = num_generated / total_time
 
         print(f"\n[REQUEST FINISHED] ID: {seq.request.request_id[:8]}...")
         print(f"  Queue Latency : {queue_latency:.4f}s")
@@ -327,23 +341,15 @@ class AsyncInferenceEngine:
     def _pytorch_step(self):
         now = time.time()
 
-        for seq in list(self.scheduler.running):
-            if seq.request.is_aborted:
-                self.scheduler.running.remove(seq)
-                if seq.block_table:
-                    self.allocator.decref(seq.block_table)
-                    seq.block_table.clear()
-                continue
-                
-        for seq in list(self.scheduler.waiting):
-            if seq.request.is_aborted:
-                self.scheduler.waiting.remove(seq)
-                continue
+        if not self.config["ENABLE_CONTINUOUS_BATCHING"]:
+            self.scheduler.max_batch_size = 1
+        else:
+            self.scheduler.max_batch_size = 4 
 
         for seq in self.scheduler.running:
-            if seq.start_time == 0.0:
-                seq.start_time = now
-
+            if seq.request.metrics["admitted_at"] == 0.0:
+                seq.request.metrics["admitted_at"] = now
+                seq.request.metrics["prefill_start"] = now
 
         prefill_seqs, decode_seqs = self.scheduler.step()
         outputs = []
@@ -359,6 +365,11 @@ class AsyncInferenceEngine:
         prefill_seqs = active_prefill_seqs
 
         for seq in prefill_seqs:
+            max_chunk = self.max_chunk_size if self.config["ENABLE_CHUNKED_PREFILL"] else 100000
+            
+            remaining_len = len(seq.prompt_token_ids) - seq.computed_len
+            chunk_len = min(remaining_len, max_chunk)
+
             remaining_len = len(seq.prompt_token_ids) - seq.computed_len
             chunk_len = min(remaining_len, self.max_chunk_size)
             new_computed_len = seq.computed_len + chunk_len
@@ -433,6 +444,9 @@ class AsyncInferenceEngine:
             seq.computed_len = new_computed_len
 
             if new_computed_len == len(seq.prompt_token_ids):
+                if seq.request.metrics["first_token_time"] == 0.0:
+                    seq.request.metrics["first_token_time"] = time.time()
+
                 next_token = self._sample(out.logits[0, -1].unsqueeze(0), [seq])[0]
                 seq.generated_token_ids.append(next_token)
 
@@ -455,7 +469,6 @@ class AsyncInferenceEngine:
                     newly_cached = self.radix_cache.insert(seq.prompt_token_ids, blocks)
                     if newly_cached:
                         self.allocator.incref(newly_cached)
-
         if decode_seqs:
             active_decode_seqs = []
             for seq in decode_seqs:
@@ -467,14 +480,18 @@ class AsyncInferenceEngine:
             decode_seqs = active_decode_seqs
             
             if not decode_seqs:
-                return outputs
+                return outputs, len(prefill_seqs) > 0
+
+            current_decode_batch_size = len(decode_seqs)
+            for seq in decode_seqs:
+                seq.request.metrics["decode_steps"] += 1
+                seq.request.metrics["sum_decode_batch_size"] += current_decode_batch_size
 
             kv_indptr_list = [0]
             kv_indices_list = []
             kv_last_page_len_list = []
 
             for seq in decode_seqs:
-
                 kv_indices_list.extend(seq.block_table)
                 kv_indptr_list.append(len(kv_indices_list))
 
@@ -503,19 +520,15 @@ class AsyncInferenceEngine:
                 device=self.model.device,
             )
 
-            append_indptr = torch.arange(
-                len(decode_seqs) + 1,
-                dtype=torch.int32,
-                device=self.model.device,
+            FlashInferState.batch_indices = torch.arange(
+                len(decode_seqs), dtype=torch.int32, device=self.model.device
             )
-
-            seq_lens = torch.ones(
-                len(decode_seqs),
+            
+            FlashInferState.positions = torch.tensor(
+                [seq.get_len - 1 for seq in decode_seqs],
                 dtype=torch.int32,
-                device=self.model.device,
+                device=self.model.device
             )
-
-            build_batch_indices_positions(append_indptr, seq_lens)
 
             plan_decode(
                 kv_indptr=kv_indptr,
@@ -538,7 +551,6 @@ class AsyncInferenceEngine:
                 device=self.model.device,
             )
 
-
             out = self.model(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -549,6 +561,9 @@ class AsyncInferenceEngine:
 
             for i, seq in enumerate(decode_seqs):
                 seq.generated_token_ids.append(next_tokens[i])
+                
+                if seq.request.metrics["first_token_time"] == 0.0:
+                    seq.request.metrics["first_token_time"] = time.time()
 
                 full_text = self.tokenizer.decode(
                     seq.prompt_token_ids + seq.generated_token_ids,

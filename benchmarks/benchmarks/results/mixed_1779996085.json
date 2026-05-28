@@ -1,0 +1,23 @@
+{
+    "scenario": "mixed",
+    "timestamp": "2026-05-29T00:51:25.642460",
+    "concurrency": 30,
+    "success_rate": 1.0,
+    "total_time_seconds": 3.0,
+    "total_tokens": 51,
+    "throughput_tokens_per_sec": 17.01,
+    "metrics": {
+        "ttft_seconds": {
+            "mean": 2.499,
+            "p50": 2.453,
+            "p90": 2.994,
+            "p99": 2.996
+        },
+        "tpot_ms": {
+            "mean": 400.86,
+            "p50": 541.93,
+            "p90": 542.22,
+            "p99": 1406.09
+        }
+    }
+}

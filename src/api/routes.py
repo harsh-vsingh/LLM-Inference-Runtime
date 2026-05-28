@@ -11,6 +11,7 @@ from api.schemas import ChatCompletionRequest
 from engine.request import InferenceRequest
 from engine.async_engine import AsyncInferenceEngine
 from models.loader import ModelLoader
+from pydantic import BaseModel
 
 router = APIRouter()
 model_load_lock = asyncio.Lock()
@@ -105,16 +106,29 @@ async def chat_completions(req: ChatCompletionRequest, http_request: Request):
                     yield f"data: {json.dumps(chunk)}\n\n"
                     
                 if not inference_req.is_aborted:
+                    m = inference_req.metrics
+                    
+                    avg_batch = m["sum_decode_batch_size"] / max(m["decode_steps"], 1)
+                    
                     final_chunk = {
                         "id": request_id,
                         "object": "chat.completion.chunk",
                         "created": created_time,
                         "model": requested_model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {},
-                            "finish_reason": "stop"
-                        }]
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        "usage": {
+                            "prompt_tokens": len(inference_req.prompt),
+                            "completion_tokens": m["tokens_generated"],
+                            "total_tokens": len(inference_req.prompt) + m["tokens_generated"],
+                            "optiserve_metrics": {
+                                "queue_latency": max(0.0, m["admitted_at"] - m["created_at"]),
+                                "prefill_latency": max(0.01, m["first_token_time"] - m["prefill_start"]), 
+                                "decode_time": max(0.01, time.time() - m["first_token_time"]) if m["first_token_time"] > 0 else 0.0,                                "prefix_depth": m["prefix_depth_tokens"],
+                                "cache_blocks_reused": m["cache_blocks_reused"],
+                                "avg_decode_batch_size": round(avg_batch, 2),
+                                "ttft": max(0.01, m["first_token_time"] - m["created_at"])
+                            }
+                        }
                     }
                     yield f"data: {json.dumps(final_chunk)}\n\n"
                     
@@ -177,3 +191,42 @@ async def list_models(http_request: Request) -> Dict[str, Any]:
         "object": "list",
         "data": data
     }
+class EngineConfigUpdate(BaseModel):
+    ENABLE_PREFIX_CACHE: bool | None = None
+    ENABLE_CONTINUOUS_BATCHING: bool | None = None
+    ENABLE_CHUNKED_PREFILL: bool | None = None
+    CLEAR_CACHE: bool = False
+
+@router.post("/v1/admin/config")
+async def update_engine_config(config: EngineConfigUpdate, request: Request):
+    app_state = request.app.state
+    
+    if not hasattr(app_state, "engines"):
+        if hasattr(app_state, "engine"):
+            app_state.engines = {getattr(app_state, "model_name", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"): app_state.engine}
+        else:
+            app_state.engines = {}
+            
+    engine = app_state.engines.get("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    
+    if not engine:
+        return {"error": "Engine not loaded. Please send a warmup chat completion request first."}
+
+    if config.ENABLE_PREFIX_CACHE is not None:
+        engine.config["ENABLE_PREFIX_CACHE"] = config.ENABLE_PREFIX_CACHE
+    if config.ENABLE_CONTINUOUS_BATCHING is not None:
+        engine.config["ENABLE_CONTINUOUS_BATCHING"] = config.ENABLE_CONTINUOUS_BATCHING
+    if config.ENABLE_CHUNKED_PREFILL is not None:
+        engine.config["ENABLE_CHUNKED_PREFILL"] = config.ENABLE_CHUNKED_PREFILL
+    if config.CLEAR_CACHE:
+        if hasattr(engine, "radix_cache"):
+            engine.radix_cache.reset()
+            
+        if hasattr(engine, "block_allocator"):
+            engine.block_allocator.free_all()
+        elif hasattr(engine, "allocator"):
+            engine.allocator.free_all()
+        elif hasattr(engine, "memory_manager"):
+            engine.memory_manager.free_all()
+            
+        print("\n[ADMIN] Radix Cache Cleared & VRAM freed for benchmark run.\n")

@@ -61,3 +61,9 @@ class BlockAllocator:
 
     def get_available_blocks(self) -> int:
         return len(self.free_blocks)
+    
+    def free_all(self):
+        """Forces all blocks back into the free pool."""
+        self.free_blocks = list(range(self.num_blocks))
+        for i in range(self.num_blocks):
+            self.ref_counts[i] = 0
