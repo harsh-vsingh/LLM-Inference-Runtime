@@ -16,13 +16,17 @@ class Sequence:
         
         self.generated_token_ids: List[int] = []
         self.status = SequenceStatus.WAITING
+        
+        self.block_table: List[int] = []
         self.past_key_values: Optional[Any] = None
+        
         self.prev_text = ""
 
         self.arrival_time = time.time()
         self.start_time = 0.0
         self.first_token_time = 0.0
         self.finish_time = 0.0
+
 
     @property
     def get_len(self) -> int:
