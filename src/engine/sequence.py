@@ -1,5 +1,6 @@
 from enum import Enum
 from typing import List, Optional, Any
+import time
 from engine.request import InferenceRequest
 
 class SequenceStatus(Enum):
@@ -17,6 +18,11 @@ class Sequence:
         self.status = SequenceStatus.WAITING
         self.past_key_values: Optional[Any] = None
         self.prev_text = ""
+
+        self.arrival_time = time.time()
+        self.start_time = 0.0
+        self.first_token_time = 0.0
+        self.finish_time = 0.0
 
     @property
     def get_len(self) -> int:
