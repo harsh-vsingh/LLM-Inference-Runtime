@@ -45,3 +45,8 @@ def get_model_loader(model_name: str, use_quantization: bool = True) -> ModelLoa
     model_loader = ModelLoader(model_name, use_quantization)
     model_loader.load_model()
     return model_loader
+
+loader = get_model_loader("TinyLlama/TinyLlama-1.1B-Chat-v1.0", use_quantization=True)
+model = loader.get_model()
+tokenizer = loader.get_tokenizer()
+print(model.config._attn_implementation)
