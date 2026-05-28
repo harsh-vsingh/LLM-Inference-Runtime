@@ -19,6 +19,7 @@ async def lifespan(app: FastAPI):
     engine.start()
     
     app.state.engine = engine
+    app.state.model_name = model_name  # FIX: Expose model name to routes
     
     yield
 

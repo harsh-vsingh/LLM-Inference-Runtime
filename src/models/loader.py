@@ -3,7 +3,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 class ModelLoader:
-    def __init__(self, model_name: str, use_quantization: bool = True):
+    def __init__(self, model_name: str, use_quantization: bool = False):
         self.model_name = model_name
         self.use_quantization = use_quantization
         self.model = None
@@ -41,12 +41,13 @@ class ModelLoader:
             raise RuntimeError("Tokenizer not loaded. Call load_model() first.")
         return self.tokenizer
 
-def get_model_loader(model_name: str, use_quantization: bool = True) -> ModelLoader:
+def get_model_loader(model_name: str, use_quantization: bool = False) -> ModelLoader:
     model_loader = ModelLoader(model_name, use_quantization)
     model_loader.load_model()
     return model_loader
 
-loader = get_model_loader("TinyLlama/TinyLlama-1.1B-Chat-v1.0", use_quantization=True)
-model = loader.get_model()
-tokenizer = loader.get_tokenizer()
-print(model.config._attn_implementation)
+if __name__ == "__main__":
+    loader = get_model_loader("TinyLlama/TinyLlama-1.1B-Chat-v1.0", use_quantization=False)
+    model = loader.get_model()
+    tokenizer = loader.get_tokenizer()
+    print(model.config._attn_implementation)

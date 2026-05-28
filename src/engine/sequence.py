@@ -10,6 +10,7 @@ class SequenceStatus(Enum):
     FINISHED = 2
 
 
+
 class Sequence:
     def __init__(
         self,
@@ -18,24 +19,22 @@ class Sequence:
         eos_token_id: int,
     ):
         self.request = request
-
         self.prompt_token_ids = prompt_token_ids
-        self.eos_token_id = eos_token_id
-
         self.generated_token_ids: List[int] = []
+        self.eos_token_id = eos_token_id
 
         self.status = SequenceStatus.WAITING
 
         self.block_table: List[int] = []
 
-        self.cached_prefix_len = 0
-
-        self.prev_text = ""
-
         self.arrival_time = time.time()
         self.start_time = 0.0
         self.first_token_time = 0.0
         self.finish_time = 0.0
+
+        self.cached_prefix_len = 0
+        self.computed_len = 0  
+        self.prev_text = ""
 
     @property
     def uncached_token_ids(self):
@@ -49,12 +48,15 @@ class Sequence:
             len(self.prompt_token_ids) +
             len(self.generated_token_ids)
         )
+        
+    def get_num_uncomputed_tokens(self) -> int:
+        return self.get_len - self.computed_len
 
     def is_finished(self):
         if self.status == SequenceStatus.FINISHED:
             return True
 
-        if self.request.is_cancelled:
+        if self.request.is_aborted:
             return True
 
         if (

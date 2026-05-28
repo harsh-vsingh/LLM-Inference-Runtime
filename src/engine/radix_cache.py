@@ -103,14 +103,20 @@ class RadixCache:
             if len(evicted) >= num_blocks:
                 break
 
-            # ONLY evict if the cache is the ONLY owner (ref_count == 1)
-            if ref_counts[leaf.block_id] > 1:
-                continue
-
-            evicted.append(leaf.block_id)
-
-            parent = leaf.parent
-            if parent is not None and leaf.chunk is not None:
-                del parent.children[leaf.chunk]
+            node = leaf
+            while (
+                node is not None
+                and node is not self.root
+                and not node.children
+                and len(evicted) < num_blocks
+                and ref_counts[node.block_id] == 1
+            ):
+                evicted.append(node.block_id)
+                
+                parent = node.parent
+                if parent is not None and node.chunk is not None:
+                    del parent.children[node.chunk]
+                    
+                node = parent
 
         return evicted
