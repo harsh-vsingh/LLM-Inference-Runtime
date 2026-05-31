@@ -230,3 +230,14 @@ async def update_engine_config(config: EngineConfigUpdate, request: Request):
             engine.memory_manager.free_all()
             
         print("\n[ADMIN] Radix Cache Cleared & VRAM freed for benchmark run.\n")
+
+@router.get("/metrics")
+async def metrics(request: Request):
+    app_state = request.app.state
+
+    if not hasattr(app_state, "engines"):
+        return {"error": "No engine loaded"}
+
+    engine = next(iter(app_state.engines.values()))
+
+    return engine.get_metrics()

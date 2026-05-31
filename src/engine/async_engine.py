@@ -1,6 +1,7 @@
 import asyncio
 import math
 import time
+from pyparsing import deque
 import torch
 from typing import Optional
 
@@ -29,7 +30,7 @@ class AsyncInferenceEngine:
     ):
         self.model = model
         self.tokenizer = tokenizer
-
+        self.start_time = time.time()
         self.config = {
                     "ENABLE_CONTINUOUS_BATCHING": True,
                     "ENABLE_CHUNKED_PREFILL": True,
@@ -42,6 +43,12 @@ class AsyncInferenceEngine:
         self.block_size = 16
         self.radix_cache = RadixCache(block_size=self.block_size)
         
+        self.recent_finished_requests = deque(maxlen=128)
+
+        self.last_tokens_snapshot = 0
+        self.last_metrics_time = time.time()
+        self.current_tps = 0.0
+        
         self.max_chunk_size = 512
 
         self.num_layers = config.num_hidden_layers
@@ -51,7 +58,7 @@ class AsyncInferenceEngine:
         self.head_dim = config.hidden_size // config.num_attention_heads
 
         self.allocator = BlockAllocator(
-            num_blocks=2048,
+            num_blocks=4096,
             block_size=self.block_size,
             num_layers=self.num_layers,
             num_kv_heads=self.num_kv_heads,
@@ -122,6 +129,7 @@ class AsyncInferenceEngine:
         self.scheduler.add_sequence(seq)
         self.wakeup_event.set()
 
+
     async def _log_system_metrics(self):
         while True:
             await asyncio.sleep(5)
@@ -146,6 +154,21 @@ class AsyncInferenceEngine:
                     self.total_decode_time = 0.0
                     self.total_steps = 0
 
+                now = time.time()
+                dt = now - self.last_metrics_time
+
+                generated_since_last = (
+                    self.total_generated_tokens
+                    - self.last_tokens_snapshot
+                )
+
+                self.current_tps = (
+                    generated_since_last / max(dt, 1e-6)
+                )
+
+                self.last_tokens_snapshot = self.total_generated_tokens
+                self.last_metrics_time = now
+
                 print(
                     f"[METRICS] "
                     f"Batch Size: {active_batch}/{self.scheduler.max_num_seqs} | "
@@ -155,6 +178,93 @@ class AsyncInferenceEngine:
                     f"Avg Prefill: {avg_prefill_time:.2f}ms | "
                     f"Avg Decode: {avg_decode_time:.2f}ms"
                 )
+
+
+    def get_metrics(self):
+        allocated = torch.cuda.memory_allocated() / (1024 ** 3)
+        reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+
+        total_blocks = self.allocator.num_blocks
+        free_blocks = len(self.allocator.free_blocks)
+        active_blocks = total_blocks - free_blocks
+
+        bytes_per_token = (
+            self.num_layers
+            * 2
+            * self.num_kv_heads
+            * self.head_dim
+            * torch.tensor([], dtype=self.model.dtype).element_size()
+        )
+
+        block_bytes = (
+            self.block_size
+            * bytes_per_token
+        )
+
+        kv_cache_gb = (
+            total_blocks * block_bytes
+        ) / (1024 ** 3)
+        hit_rate = (
+            (self.cached_prompt_tokens / self.total_prompt_tokens) * 100
+            if self.total_prompt_tokens > 0
+            else 0.0
+        )
+
+        recent = list(self.recent_finished_requests)
+
+        avg_ttft = (
+            sum(r["ttft_ms"] for r in recent) / len(recent)
+            if recent else 0
+        )
+
+        avg_tpot = (
+            sum(r["tpot_ms"] for r in recent) / len(recent)
+            if recent else 0
+        )
+
+        return {
+            "scheduler": {
+                "running": len(self.scheduler.running),
+                "waiting": len(self.scheduler.waiting),
+                "active_prefills": 0,
+                "active_decodes": len(self.scheduler.running),
+                "preempts": 0,
+            },
+
+            "allocator": {
+                "total_blocks": total_blocks,
+                "free_blocks": free_blocks,
+                "active_blocks": active_blocks,
+                "utilization_pct": (
+                    active_blocks / total_blocks * 100
+                ),
+            },
+
+            "performance": {
+                "tokens_per_second": self.current_tps,
+                "cache_hit_rate": hit_rate,
+                "avg_ttft_ms": avg_ttft,
+                "avg_tpot_ms": avg_tpot,
+                "avg_decode_batch_size": len(self.scheduler.running),
+            },
+
+            "gpu": {
+                "allocated_gb": allocated,
+                "reserved_gb": reserved,
+                "kv_cache_gb": kv_cache_gb,
+            },
+
+            "debug_requests": [
+                {
+                    "request_id": seq.request.request_id[:8],
+                    "prompt_tokens": len(seq.prompt_token_ids),
+                    "generated_tokens": len(seq.generated_token_ids),
+                    "cached_prefix": seq.cached_prefix_len,
+                    "status": str(seq.status),
+                }
+                for seq in self.scheduler.running[:32]
+            ]
+        }
 
     async def _process_loop(self):
         while True:
@@ -225,6 +335,14 @@ class AsyncInferenceEngine:
 
         total_time = max(now - m["created_at"], 0.01)
         throughput = num_generated / total_time
+
+        self.recent_finished_requests.append(
+            {
+                "ttft_ms": seq.ttft * 1000,
+                "tpot_ms": seq.tpot * 1000,
+                "throughput": seq.throughput,
+            }
+        )
 
         print(f"\n[REQUEST FINISHED] ID: {seq.request.request_id[:8]}...")
         print(f"  Queue Latency : {queue_latency:.4f}s")
@@ -479,6 +597,7 @@ class AsyncInferenceEngine:
                 
             decode_seqs = active_decode_seqs
             
+
             if not decode_seqs:
                 return outputs, len(prefill_seqs) > 0
 

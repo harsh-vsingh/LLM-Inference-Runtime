@@ -72,3 +72,47 @@ class Sequence:
             return True
 
         return False
+
+
+    @property
+    def queue_latency(self):
+        if self.start_time == 0.0:
+            return 0.0
+
+        return self.start_time - self.arrival_time
+
+
+    @property
+    def ttft(self):
+        if self.first_token_time == 0.0:
+            return 0.0
+
+        return self.first_token_time - self.arrival_time
+
+
+    @property
+    def generation_time(self):
+        if self.finish_time == 0.0:
+            return 0.0
+
+        return self.finish_time - self.first_token_time
+
+
+    @property
+    def tpot(self):
+        generated = len(self.generated_token_ids)
+
+        if generated <= 1:
+            return 0.0
+
+        return self.generation_time / (generated - 1)
+
+
+    @property
+    def throughput(self):
+        total_time = self.finish_time - self.arrival_time
+
+        if total_time <= 0:
+            return 0.0
+
+        return len(self.generated_token_ids) / total_time
