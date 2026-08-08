@@ -1,243 +1,91 @@
-import uuid
-import json
 import time
-import asyncio
-import torch
-from fastapi import APIRouter, Request, HTTPException
+from fastapi import APIRouter, Request, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from typing import List, Dict, Any
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
-from api.schemas import ChatCompletionRequest
-from engine.request import InferenceRequest
+from typing import Dict, Any
+from api.schemas import ChatCompletionRequest, EngineConfigUpdate
+from api.dependencies import get_engine_registry, get_engine
+from services.engine_registry import EngineRegistry
 from engine.async_engine import AsyncInferenceEngine
-from models.loader import ModelLoader
-from pydantic import BaseModel
+from services import inference_service
+from services import admin_service
+from services import metrics_service
+from core.logging import get_logger
 
 router = APIRouter()
-model_load_lock = asyncio.Lock()
+logger = get_logger(__name__)
 
-def load_engine_synchronously(model_name: str) -> AsyncInferenceEngine:
-    loader = ModelLoader(model_name, use_quantization=False)
-    loader.load_model()
-    
-    engine = AsyncInferenceEngine(
-        model=loader.get_model(), 
-        tokenizer=loader.get_tokenizer(), 
-        max_num_seqs=256, 
-        max_num_batched_tokens=4096
-    )
-    engine.start()
-    return engine
 
 @router.post("/v1/chat/completions")
-async def chat_completions(req: ChatCompletionRequest, http_request: Request):
-    app_state = http_request.app.state
-    
-    if not hasattr(app_state, "engines"):
-        if hasattr(app_state, "engine"):
-            app_state.engines = {app_state.model_name: app_state.engine}
-        else:
-            app_state.engines = {}
+async def chat_completions(
+    req: ChatCompletionRequest,
+    request: Request,
+    registry: EngineRegistry = Depends(get_engine_registry),
+    engine: AsyncInferenceEngine = Depends(get_engine),
+):
+    model_name = registry.get_model_name()
 
-    requested_model = req.model
+    if req.model != model_name:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{req.model}' is not served by this runtime."
+        )
 
-    if requested_model not in app_state.engines:
-        try:
-            config = await asyncio.to_thread(AutoConfig.from_pretrained, requested_model)
-            if config.model_type != "llama":
-                raise HTTPException(
-                    status_code=400, 
-                    detail=f"Architecture '{config.model_type}' is not supported. Only 'llama' models are supported."
-                )
-        except HTTPException:
-            raise
-        except Exception as e:
-            raise HTTPException(status_code=404, detail=f"Failed to fetch model config from Hub: {str(e)}")
-
-        async with model_load_lock:
-            if requested_model not in app_state.engines:
-                try:
-                    new_engine = await asyncio.to_thread(load_engine_synchronously, requested_model)
-                    app_state.engines[requested_model] = new_engine
-                except Exception as e:
-                    raise HTTPException(status_code=500, detail=f"Failed to load weights: {str(e)}")
-                    
-    engine: AsyncInferenceEngine = app_state.engines[requested_model]
-    
-    messages_dict = [{"role": m.role, "content": m.content} for m in req.messages]
-    prompt = engine.tokenizer.apply_chat_template(messages_dict, tokenize=False, add_generation_prompt=True)
-    
-    request_id = f"chatcmpl-{uuid.uuid4().hex}"
-    
-    inference_req = InferenceRequest(
-        request_id=request_id,
-        prompt=prompt,
-        max_new_tokens=req.max_tokens or 50,
-        temperature=req.temperature if req.temperature is not None else 0.0,
-        top_p=req.top_p if req.top_p is not None else 1.0,
-    )
-    
-    await engine.add_request(inference_req)
+    try:
+        request_id, inference_req = await inference_service.submit_chat_completion(engine, req)
+    except Exception:
+        logger.exception("Failed to submit chat completion request")
+        raise HTTPException(status_code=500, detail="Failed to process request.")
 
     if req.stream:
-        async def stream_generator():
-            try:
-                created_time = int(time.time())
-                while True:
-                    if await http_request.is_disconnected():
-                        inference_req.abort()
-                        break
-                    
-                    token = await inference_req.output_queue.get()
-                    if token is None:
-                        break
-                    
-                    chunk = {
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_time,
-                        "model": requested_model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": token},
-                            "finish_reason": None
-                        }]
-                    }
-                    yield f"data: {json.dumps(chunk)}\n\n"
-                    
-                if not inference_req.is_aborted:
-                    m = inference_req.metrics
-                    
-                    avg_batch = m["sum_decode_batch_size"] / max(m["decode_steps"], 1)
-                    
-                    final_chunk = {
-                        "id": request_id,
-                        "object": "chat.completion.chunk",
-                        "created": created_time,
-                        "model": requested_model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                        "usage": {
-                            "prompt_tokens": len(inference_req.prompt),
-                            "completion_tokens": m["tokens_generated"],
-                            "total_tokens": len(inference_req.prompt) + m["tokens_generated"],
-                            "optiserve_metrics": {
-                                "queue_latency": max(0.0, m["admitted_at"] - m["created_at"]),
-                                "prefill_latency": max(0.01, m["first_token_time"] - m["prefill_start"]), 
-                                "decode_time": max(0.01, time.time() - m["first_token_time"]) if m["first_token_time"] > 0 else 0.0,                                "prefix_depth": m["prefix_depth_tokens"],
-                                "cache_blocks_reused": m["cache_blocks_reused"],
-                                "avg_decode_batch_size": round(avg_batch, 2),
-                                "ttft": max(0.01, m["first_token_time"] - m["created_at"])
-                            }
-                        }
-                    }
-                    yield f"data: {json.dumps(final_chunk)}\n\n"
-                    
-            except asyncio.CancelledError:
-                inference_req.abort()
-                raise
-            finally:
-                yield "data: [DONE]\n\n"
-
         return StreamingResponse(
-            stream_generator(),
+            inference_service.stream_chat_completion(request, request_id, inference_req, model_name),
             media_type="text/event-stream"
         )
-        
-    else:
-        full_text = ""
-        while True:
-            token = await inference_req.output_queue.get()
-            if token is None:
-                break
-            full_text += token
 
-        return {
-            "id": request_id,
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": requested_model,
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": full_text},
-                "finish_reason": "stop"
-            }]
-        }
+    try:
+        return await inference_service.aggregate_chat_completion(request_id, inference_req, model_name)
+    except Exception:
+        logger.exception(f"[{request_id}] Failed to aggregate chat completion response")
+        raise HTTPException(status_code=500, detail="Failed to generate response.")
+
 
 @router.post("/v1/completions")
-async def completions(request: Dict[str, Any]) -> Dict[str, Any]:
-    return {"message": "Completion response not yet fully implemented"}
+async def completions(request: Dict[str, Any]):
+    raise HTTPException(
+        status_code=501,
+        detail="The /v1/completions endpoint is not implemented.",
+    )
+
 
 @router.get("/v1/models")
-async def list_models(http_request: Request) -> Dict[str, Any]:
-    app_state = http_request.app.state
-    
-    if hasattr(app_state, "engines"):
-        loaded_models = list(app_state.engines.keys())
-    elif hasattr(app_state, "model_name"):
-        loaded_models = [app_state.model_name]
-    else:
-        loaded_models = []
-
-    data = []
-    for model_name in loaded_models:
-        data.append({
-            "id": model_name,
+async def list_models(registry: EngineRegistry = Depends(get_engine_registry)) -> Dict[str, Any]:
+    return {
+        "object": "list",
+        "data": [{
+            "id": registry.get_model_name(),
             "object": "model",
             "created": int(time.time()),
             "owned_by": "optiServe"
-        })
-        
-    return {
-        "object": "list",
-        "data": data
+        }]
     }
-class EngineConfigUpdate(BaseModel):
-    ENABLE_PREFIX_CACHE: bool | None = None
-    ENABLE_CONTINUOUS_BATCHING: bool | None = None
-    ENABLE_CHUNKED_PREFILL: bool | None = None
-    CLEAR_CACHE: bool = False
+
 
 @router.post("/v1/admin/config")
-async def update_engine_config(config: EngineConfigUpdate, request: Request):
-    app_state = request.app.state
-    
-    if not hasattr(app_state, "engines"):
-        if hasattr(app_state, "engine"):
-            app_state.engines = {getattr(app_state, "model_name", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"): app_state.engine}
-        else:
-            app_state.engines = {}
-            
-    engine = app_state.engines.get("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
-    
-    if not engine:
-        return {"error": "Engine not loaded. Please send a warmup chat completion request first."}
+async def update_engine_config(
+    config: EngineConfigUpdate,
+    engine: AsyncInferenceEngine = Depends(get_engine),
+):
+    try:
+        admin_service.update_config(engine, config)
+    except Exception:
+        logger.exception("Failed to update engine config")
+        raise HTTPException(status_code=500, detail="Failed to update engine config.")
 
-    if config.ENABLE_PREFIX_CACHE is not None:
-        engine.config["ENABLE_PREFIX_CACHE"] = config.ENABLE_PREFIX_CACHE
-    if config.ENABLE_CONTINUOUS_BATCHING is not None:
-        engine.config["ENABLE_CONTINUOUS_BATCHING"] = config.ENABLE_CONTINUOUS_BATCHING
-    if config.ENABLE_CHUNKED_PREFILL is not None:
-        engine.config["ENABLE_CHUNKED_PREFILL"] = config.ENABLE_CHUNKED_PREFILL
-    if config.CLEAR_CACHE:
-        if hasattr(engine, "radix_cache"):
-            engine.radix_cache.reset()
-            
-        if hasattr(engine, "block_allocator"):
-            engine.block_allocator.free_all()
-        elif hasattr(engine, "allocator"):
-            engine.allocator.free_all()
-        elif hasattr(engine, "memory_manager"):
-            engine.memory_manager.free_all()
-            
-        print("\n[ADMIN] Radix Cache Cleared & VRAM freed for benchmark run.\n")
 
 @router.get("/metrics")
-async def metrics(request: Request):
-    app_state = request.app.state
-
-    if not hasattr(app_state, "engines"):
-        return {"error": "No engine loaded"}
-
-    engine = next(iter(app_state.engines.values()))
-
-    return engine.get_metrics()
+async def metrics(engine: AsyncInferenceEngine = Depends(get_engine)):
+    try:
+        return metrics_service.get_metrics(engine)
+    except Exception:
+        logger.exception("Failed to fetch metrics")
+        raise HTTPException(status_code=500, detail="Failed to fetch metrics.")

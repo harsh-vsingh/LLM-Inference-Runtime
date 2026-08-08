@@ -67,7 +67,7 @@ h["throughput"].append(
     perf.get("tokens_per_second", 0)
 )
 
-k1, k2, k3, k4 = st.columns(4)
+k1, k2, k3 = st.columns(3)
 
 k1.metric(
     "Throughput",
@@ -84,16 +84,13 @@ k3.metric(
     f"{perf.get('avg_ttft_ms', 0):.0f} ms"
 )
 
-k4.metric(
-    "TPOT",
-    f"{perf.get('avg_tpot_ms', 0):.0f} ms"
-)
+
 
 k5, k6, k7 = st.columns(3)
 
 k5.metric(
-    "Queue Depth",
-    sched.get("waiting", 0)
+    "TPOT",
+    f"{perf.get('avg_tpot_ms', 0):.0f} ms"
 )
 
 k6.metric(

@@ -1,5 +1,5 @@
-from pydantic import BaseModel, Field
-from typing import List, Optional, Literal, Dict, Any
+from pydantic import BaseModel, Field, field_validator
+from typing import List, Optional, Literal
 import time
 
 class ChatMessage(BaseModel):
@@ -9,10 +9,17 @@ class ChatMessage(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str
     messages: List[ChatMessage]
-    max_tokens: Optional[int] = 50
-    temperature: Optional[float] = 0.7
-    top_p: Optional[float] = 1.0
+    max_tokens: Optional[int] = Field(default=50, gt=0, le=4096)
+    temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0)
+    top_p: Optional[float] = Field(default=1.0, gt=0.0, le=1.0)
     stream: Optional[bool] = False
+
+    @field_validator("messages")
+    @classmethod
+    def messages_not_empty(cls, v: List[ChatMessage]) -> List[ChatMessage]:
+        if not v:
+            raise ValueError("messages must not be empty")
+        return v
 
 class ChatCompletionResponseChoice(BaseModel):
     index: int
@@ -41,3 +48,10 @@ class ChatCompletionStreamResponse(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     choices: List[ChatCompletionStreamResponseChoice]
+
+
+class EngineConfigUpdate(BaseModel):
+    ENABLE_PREFIX_CACHE: bool | None = None
+    ENABLE_CONTINUOUS_BATCHING: bool | None = None
+    ENABLE_CHUNKED_PREFILL: bool | None = None
+    CLEAR_CACHE: bool = False

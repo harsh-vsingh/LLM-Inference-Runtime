@@ -3,7 +3,6 @@ import math
 import time
 from pyparsing import deque
 import torch
-from typing import Optional
 
 from engine.radix_cache import RadixCache
 from engine.request import InferenceRequest
