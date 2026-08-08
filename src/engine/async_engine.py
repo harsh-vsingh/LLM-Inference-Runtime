@@ -1,22 +1,27 @@
 import asyncio
-import math
+import logging
+import os
 import time
-from pyparsing import deque
-import torch
+import uuid
+from typing import List, Optional
 
-from engine.radix_cache import RadixCache
+from engine.config import EngineConfig
+from engine.errors import AdmissionError, AdmissionRejectReason
+from engine.memory.allocator import BlockAllocator
+from engine.memory.prefix_match import match_prefix_for_new_run
+from engine.memory.radix_cache import RadixCache
+from engine.metrics.engine_metrics import EngineMetrics
+from engine.metrics.snapshot import build_metrics_snapshot
 from engine.request import InferenceRequest
+from engine.runtime.block_admission import BlockAdmission
+from engine.runtime.process_loop import ProcessLoop
+from engine.runtime.sampler import sample
+from engine.runtime.step_executor import StepExecutor
+from engine.scheduling.scheduler import Scheduler
 from engine.sequence import Sequence
-from engine.scheduler import Scheduler
-from engine.memory import BlockAllocator
-from models.llama import (
-    init_flashinfer_state,
-    patch_llama_model,
-    plan_prefill,
-    plan_decode,
-    FlashInferState, 
-    build_batch_indices_positions,
-)
+from models.llama import init_flashinfer_state, patch_llama_model
+
+logger = logging.getLogger(__name__)
 
 
 class AsyncInferenceEngine:
@@ -29,32 +34,20 @@ class AsyncInferenceEngine:
     ):
         self.model = model
         self.tokenizer = tokenizer
-        self.start_time = time.time()
-        self.config = {
-                    "ENABLE_CONTINUOUS_BATCHING": True,
-                    "ENABLE_CHUNKED_PREFILL": True,
-                    "ENABLE_PREFIX_CACHE": True,
-                }
-        
-        self.scheduler = Scheduler(max_num_batched_tokens=max_num_batched_tokens, max_num_seqs=max_num_seqs)
 
-        config = model.config
+        self.instance_id = os.environ.get("ENGINE_INSTANCE_ID", f"engine-{uuid.uuid4().hex[:8]}")
+        self.is_draining = False
+
+        self.config = EngineConfig()
+
         self.block_size = 16
-        self.radix_cache = RadixCache(block_size=self.block_size)
-        
-        self.recent_finished_requests = deque(maxlen=128)
-
-        self.last_tokens_snapshot = 0
-        self.last_metrics_time = time.time()
-        self.current_tps = 0.0
-        
         self.max_chunk_size = 512
 
-        self.num_layers = config.num_hidden_layers
-        self.num_qo_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
-
-        self.head_dim = config.hidden_size // config.num_attention_heads
+        model_config = model.config
+        self.num_layers = model_config.num_hidden_layers
+        self.num_qo_heads = model_config.num_attention_heads
+        self.num_kv_heads = model_config.num_key_value_heads
+        self.head_dim = model_config.hidden_size // model_config.num_attention_heads
 
         self.allocator = BlockAllocator(
             num_blocks=4096,
@@ -65,33 +58,67 @@ class AsyncInferenceEngine:
             dtype=model.dtype,
             device=model.device,
         )
+        self.radix_cache = RadixCache(block_size=self.block_size, allocator=self.allocator)
+        self.scheduler = Scheduler(
+            max_num_batched_tokens=max_num_batched_tokens, max_num_seqs=max_num_seqs
+        )
+        self.metrics = EngineMetrics()
 
         patch_llama_model(model)
-
         init_flashinfer_state(
             kv_pool=self.allocator.kv_pool,
             page_size=self.block_size,
             device=model.device,
         )
 
-        self.wakeup_event = asyncio.Event()
+        self._block_admission = BlockAdmission(
+            allocator=self.allocator,
+            radix_cache=self.radix_cache,
+            scheduler=self.scheduler,
+            block_size=self.block_size,
+            on_preempt=lambda seq: self.metrics.record_preemption(),
+        )
 
-        self.total_prompt_tokens = 0
-        self.cached_prompt_tokens = 0
-        
-        self.total_generated_tokens = 0
-        self.total_prefill_time = 0.0
-        self.total_decode_time = 0.0
-        self.total_steps = 0
-        self.metrics_lock = asyncio.Lock()
+        self._step_executor = StepExecutor(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            allocator=self.allocator,
+            radix_cache=self.radix_cache,
+            block_size=self.block_size,
+            max_chunk_size=self.max_chunk_size,
+            num_qo_heads=self.num_qo_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim,
+            sampler=sample,
+            allocate_blocks_fn=self._block_admission.allocate_blocks_if_needed,
+            preempt_fn=self._block_admission.preempt_sequence,
+        )
 
-    def start(self):
-        asyncio.create_task(self._process_loop())
-        self.metrics_task = asyncio.create_task(self._log_system_metrics())
+        self._process_loop = ProcessLoop(
+            scheduler=self.scheduler,
+            step_executor=self._step_executor,
+            allocator=self.allocator,
+            radix_cache=self.radix_cache,
+            engine_metrics=self.metrics,
+            block_size=self.block_size,
+            chunked_prefill_enabled_fn=lambda: self.config.enable_chunked_prefill,
+        )
 
-    async def add_request(self, request: InferenceRequest):
+        self._metrics_task: Optional[asyncio.Task] = None
+
+    def start(self) -> None:
+        self._process_loop.start()
+        self._metrics_task = asyncio.create_task(self._log_system_metrics())
+
+    async def add_request(self, request: InferenceRequest) -> None:
+        if self.is_draining:
+            raise AdmissionError(
+                AdmissionRejectReason.ENGINE_DRAINING,
+                "engine is shutting down and is not accepting new requests",
+            )
+
         prompt_ids = self.tokenizer(request.prompt).input_ids
-        self.total_prompt_tokens += len(prompt_ids)
+        request.metrics.prompt_tokens = len(prompt_ids)
 
         seq = Sequence(
             request=request,
@@ -99,597 +126,81 @@ class AsyncInferenceEngine:
             eos_token_id=self.tokenizer.eos_token_id,
         )
 
-        matched_tokens, matched_blocks = [], []
-        
-        if self.config["ENABLE_PREFIX_CACHE"]:
-            matched_tokens, matched_blocks = self.radix_cache.match_prefix(prompt_ids)
-            
-            request.metrics["prefix_depth_tokens"] = len(matched_tokens)
-            request.metrics["cache_blocks_reused"] = len(matched_blocks)
-            
-            if len(matched_tokens) == len(prompt_ids) and len(matched_blocks) > 0:
-                matched_tokens = matched_tokens[:-self.block_size]
-                matched_blocks = matched_blocks[:-1]
+        matched_tokens: List[int] = []
+        matched_blocks: List[int] = []
+
+        if self.config.enable_prefix_cache:
+            matched_tokens, matched_blocks = match_prefix_for_new_run(
+                self.radix_cache, self.allocator, prompt_ids
+            )
+            request.metrics.prefix_depth_tokens = len(matched_tokens)
+            request.metrics.cache_blocks_reused = len(matched_blocks)
+
+        self.metrics.record_prompt(
+            prompt_tokens=len(prompt_ids), cached_tokens=len(matched_tokens)
+        )
 
         seq.cached_prefix_len = len(matched_tokens)
         seq.computed_len = seq.cached_prefix_len
         seq.block_table = list(matched_blocks)
 
-        if matched_blocks:
-            self.allocator.incref(matched_blocks)
-
-        self.cached_prompt_tokens += len(matched_tokens)
-
-        seq.prev_text = self.tokenizer.decode(
-            prompt_ids,
-            skip_special_tokens=True,
-        )
-
         self.scheduler.add_sequence(seq)
-        self.wakeup_event.set()
+        self.metrics.record_admitted()
+        self._process_loop.wakeup_event.set()
 
+    def get_metrics(self) -> dict:
+        return build_metrics_snapshot(self)
 
-    async def _log_system_metrics(self):
-        while True:
-            await asyncio.sleep(5)
-            if self.scheduler.has_unfinished_sequences():
-                active_batch = len(self.scheduler.running)
-                waiting_queue = len(self.scheduler.waiting)
+    async def shutdown(self, timeout: float = 30.0) -> None:
+        logger.info("engine shutdown requested, draining in-flight requests")
+        self.is_draining = True
+        self._process_loop.request_stop()
 
-                mem_alloc = torch.cuda.memory_allocated() / (1024**3)
-                mem_res = torch.cuda.memory_reserved() / (1024**3)
+        deadline = time.time() + timeout
+        while self.scheduler.has_unfinished_sequences() and time.time() < deadline:
+            await asyncio.sleep(0.1)
 
-                hit_rate = (
-                    (self.cached_prompt_tokens / self.total_prompt_tokens) * 100
-                    if self.total_prompt_tokens > 0
-                    else 0.0
-                )
-                
-                async with self.metrics_lock:
-                    avg_prefill_time = (self.total_prefill_time / self.total_steps) * 1000 if self.total_steps > 0 else 0
-                    avg_decode_time = (self.total_decode_time / self.total_steps) * 1000 if self.total_steps > 0 else 0
-                    
-                    self.total_prefill_time = 0.0
-                    self.total_decode_time = 0.0
-                    self.total_steps = 0
-
-                now = time.time()
-                dt = now - self.last_metrics_time
-
-                generated_since_last = (
-                    self.total_generated_tokens
-                    - self.last_tokens_snapshot
-                )
-
-                self.current_tps = (
-                    generated_since_last / max(dt, 1e-6)
-                )
-
-                self.last_tokens_snapshot = self.total_generated_tokens
-                self.last_metrics_time = now
-
-                print(
-                    f"[METRICS] "
-                    f"Batch Size: {active_batch}/{self.scheduler.max_num_seqs} | "
-                    f"Waiting: {waiting_queue} | "
-                    f"Cache Hit: {hit_rate:.1f}% | "
-                    f"VRAM: {mem_alloc:.2f}GB/{mem_res:.2f}GB | "
-                    f"Avg Prefill: {avg_prefill_time:.2f}ms | "
-                    f"Avg Decode: {avg_decode_time:.2f}ms"
-                )
-
-
-    def get_metrics(self):
-        allocated = torch.cuda.memory_allocated() / (1024 ** 3)
-        reserved = torch.cuda.memory_reserved() / (1024 ** 3)
-
-        total_blocks = self.allocator.num_blocks
-        free_blocks = len(self.allocator.free_blocks)
-        active_blocks = total_blocks - free_blocks
-
-        bytes_per_token = (
-            self.num_layers
-            * 2
-            * self.num_kv_heads
-            * self.head_dim
-            * torch.tensor([], dtype=self.model.dtype).element_size()
-        )
-
-        block_bytes = (
-            self.block_size
-            * bytes_per_token
-        )
-
-        kv_cache_gb = (
-            total_blocks * block_bytes
-        ) / (1024 ** 3)
-        hit_rate = (
-            (self.cached_prompt_tokens / self.total_prompt_tokens) * 100
-            if self.total_prompt_tokens > 0
-            else 0.0
-        )
-
-        recent = list(self.recent_finished_requests)
-
-        avg_ttft = (
-            sum(r["ttft_ms"] for r in recent) / len(recent)
-            if recent else 0
-        )
-
-        avg_tpot = (
-            sum(r["tpot_ms"] for r in recent) / len(recent)
-            if recent else 0
-        )
-
-        return {
-            "scheduler": {
-                "running": len(self.scheduler.running),
-                "waiting": len(self.scheduler.waiting),
-                "active_prefills": 0,
-                "active_decodes": len(self.scheduler.running),
-                "preempts": 0,
-            },
-
-            "allocator": {
-                "total_blocks": total_blocks,
-                "free_blocks": free_blocks,
-                "active_blocks": active_blocks,
-                "utilization_pct": (
-                    active_blocks / total_blocks * 100
-                ),
-            },
-
-            "performance": {
-                "tokens_per_second": self.current_tps,
-                "cache_hit_rate": hit_rate,
-                "avg_ttft_ms": avg_ttft,
-                "avg_tpot_ms": avg_tpot,
-                "avg_decode_batch_size": len(self.scheduler.running),
-            },
-
-            "gpu": {
-                "allocated_gb": allocated,
-                "reserved_gb": reserved,
-                "kv_cache_gb": kv_cache_gb,
-            },
-
-            "debug_requests": [
-                {
-                    "request_id": seq.request.request_id[:8],
-                    "prompt_tokens": len(seq.prompt_token_ids),
-                    "generated_tokens": len(seq.generated_token_ids),
-                    "cached_prefix": seq.cached_prefix_len,
-                    "status": str(seq.status),
-                }
-                for seq in self.scheduler.running[:32]
-            ]
-        }
-
-    async def _process_loop(self):
-        while True:
-            await self.wakeup_event.wait()
-
-            while self.scheduler.has_unfinished_sequences():
-                try:
-                    step_start = time.time()
-                    step_outputs, is_prefill = await asyncio.to_thread(self._pytorch_step)
-                    step_duration = time.time() - step_start
-                    
-                    async with self.metrics_lock:
-                        if is_prefill:
-                            self.total_prefill_time += step_duration
-                        else:
-                            self.total_decode_time += step_duration
-                        self.total_steps += 1
-                        self.total_generated_tokens += len(step_outputs)
-
-                    for seq, new_text in step_outputs:
-                        await seq.request.put_token(new_text)
-
-                        if seq.is_finished():
-                            seq.finish_time = time.time()
-                            self._calculate_and_log_request_metrics(seq)
-
-                            full_tokens = seq.prompt_token_ids + seq.generated_token_ids
-                            full_block_count = math.ceil(len(full_tokens) / self.block_size)
-                            blocks = seq.block_table[:full_block_count]
-
-                            newly_cached = self.radix_cache.insert(full_tokens, blocks)
-                            if newly_cached:
-                                self.allocator.incref(newly_cached)
-                                
-                            self.allocator.decref(seq.block_table)
-
-                            seq.block_table.clear()
-                            await seq.request.finish()
-
-                except Exception as e:
-                    print(f"Engine Loop Error: {e}")
-                    import traceback
-                    traceback.print_exc()
-
-                    for seq in self.scheduler.running:
-                        seq.status = seq.status.FINISHED
-                        self.allocator.decref(seq.block_table)
-                        seq.block_table.clear()
-                        await seq.request.finish()
-
-                    self.scheduler.running.clear()
-                    await asyncio.sleep(0.1)
-
-            self.wakeup_event.clear()
-
-    def _calculate_and_log_request_metrics(self, seq: Sequence):
-        m = seq.request.metrics
-        now = time.time() 
-
-        queue_latency = max(0.0, m["admitted_at"] - m["created_at"])
-        ttft = max(0.0, m["first_token_time"] - m["created_at"])
-        num_generated = m["tokens_generated"]
-
-        if num_generated > 1:
-            tpot = (now - m["first_token_time"]) / (num_generated - 1)
-        else:
-            tpot = 0.0
-
-        total_time = max(now - m["created_at"], 0.01)
-        throughput = num_generated / total_time
-
-        self.recent_finished_requests.append(
-            {
-                "ttft_ms": seq.ttft * 1000,
-                "tpot_ms": seq.tpot * 1000,
-                "throughput": seq.throughput,
-            }
-        )
-
-        print(f"\n[REQUEST FINISHED] ID: {seq.request.request_id[:8]}...")
-        print(f"  Queue Latency : {queue_latency:.4f}s")
-        print(f"  TTFT          : {ttft:.4f}s")
-        print(f"  TPOT          : {tpot*1000:.2f}ms/token")
-        print(f"  Throughput    : {throughput:.2f} tokens/s")
-        print(f"  Tokens        : {num_generated} generated, {len(seq.prompt_token_ids)} prompt")
-
-    def _ensure_free_blocks(self, needed_blocks: int):
-        available = self.allocator.get_available_blocks()
-        if available >= needed_blocks:
-            return
-
-        to_free = needed_blocks - available
-
-        evicted = self.radix_cache.evict_lru(
-            to_free,
-            self.allocator.ref_counts,
-        )
-        
-        if evicted:
-            self.allocator.decref(evicted)
-
-
-    def _allocate_blocks_if_needed(self, seq: Sequence) -> bool:
-        logical_blocks = math.ceil(seq.get_len / self.block_size)
-        current_blocks = len(seq.block_table)
-        needed = logical_blocks - current_blocks
-
-        if needed <= 0:
-            return True
-
-        available = self.allocator.get_available_blocks()
-        if available < needed:
-            to_free = needed - available
-            evicted = self.radix_cache.evict_lru(to_free, self.allocator.ref_counts)
-            if evicted:
-                self.allocator.decref(evicted)
-                
-        if self.allocator.get_available_blocks() < needed:
-            return False
-
-        new_blocks = self.allocator.allocate(needed)
-        seq.block_table.extend(new_blocks)
-        return True
-
-
-    def _preempt_sequence(self, seq: Sequence):
-        print(f"[PREEMPT] Suspending {seq.request.request_id[:8]} due to VRAM exhaustion.")
-        
-        if seq.block_table:
-            self.allocator.decref(seq.block_table)
-            seq.block_table.clear()
-            
-        seq.prompt_token_ids.extend(seq.generated_token_ids)
-        seq.generated_token_ids.clear()
-        
-        matched_tokens, matched_blocks = self.radix_cache.match_prefix(seq.prompt_token_ids)
-        
-        if len(matched_tokens) == len(seq.prompt_token_ids) and len(matched_blocks) > 0:
-            matched_tokens = matched_tokens[:-self.block_size]
-            matched_blocks = matched_blocks[:-1]
-
-        seq.cached_prefix_len = len(matched_tokens)
-        seq.computed_len = seq.cached_prefix_len  
-        seq.block_table = list(matched_blocks)
-        
-        if matched_blocks:
-            self.allocator.incref(matched_blocks)
-            
-        if seq in self.scheduler.running:
-            self.scheduler.running.remove(seq)
-            
-
-        self.scheduler.waiting.insert(0, seq)
-
-    def _sample(self, logits: torch.Tensor, seqs: list[Sequence]) -> list[int]:
-        """
-        Applies temperature and top-p sampling per-sequence in the active batch.
-        """
-        next_tokens = []
-        
-        for i, seq in enumerate(seqs):
-            temp = getattr(seq.request, "temperature", 0.0)
-            top_p = getattr(seq.request, "top_p", 1.0)
-            
-            logit = logits[i].float()
-            
-            if temp <= 1e-6:
-                next_tokens.append(int(torch.argmax(logit).item()))
-                continue
-                
-            logit = logit / temp
-            probs = torch.softmax(logit, dim=-1)
-            
-            if top_p < 1.0:
-                sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-                cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-                
-                sorted_indices_to_remove = cumulative_probs > top_p
-                sorted_indices_to_remove[1:] = sorted_indices_to_remove[:-1].clone()
-                sorted_indices_to_remove[0] = False
-                
-                indices_to_remove = sorted_indices[sorted_indices_to_remove]
-                logit[indices_to_remove] = -float('Inf')
-                probs = torch.softmax(logit, dim=-1)
-                
-            token_id = torch.multinomial(probs, num_samples=1).item()
-            next_tokens.append(int(token_id))
-            
-        return next_tokens
-
-    @torch.inference_mode()
-    def _pytorch_step(self):
-        now = time.time()
-
-        if not self.config["ENABLE_CONTINUOUS_BATCHING"]:
-            self.scheduler.max_batch_size = 1
-        else:
-            self.scheduler.max_batch_size = 4 
-
-        for seq in self.scheduler.running:
-            if seq.request.metrics["admitted_at"] == 0.0:
-                seq.request.metrics["admitted_at"] = now
-                seq.request.metrics["prefill_start"] = now
-
-        prefill_seqs, decode_seqs = self.scheduler.step()
-        outputs = []
-
-        active_prefill_seqs = []
-        for seq in prefill_seqs:
-            if not self._allocate_blocks_if_needed(seq):
-                self._preempt_sequence(seq)
-                continue
-            active_prefill_seqs.append(seq)
-            
-        
-        prefill_seqs = active_prefill_seqs
-
-        for seq in prefill_seqs:
-            max_chunk = self.max_chunk_size if self.config["ENABLE_CHUNKED_PREFILL"] else 100000
-            
-            remaining_len = len(seq.prompt_token_ids) - seq.computed_len
-            chunk_len = min(remaining_len, max_chunk)
-
-            remaining_len = len(seq.prompt_token_ids) - seq.computed_len
-            chunk_len = min(remaining_len, self.max_chunk_size)
-            new_computed_len = seq.computed_len + chunk_len
-            
-            chunk_ids = seq.prompt_token_ids[seq.computed_len : new_computed_len]
-            logical_blocks_needed = math.ceil(new_computed_len / self.block_size)
-            blocks_to_use = seq.block_table[:logical_blocks_needed]
-
-            kv_indptr = torch.tensor(
-                [0, len(blocks_to_use)],
-                dtype=torch.int32,
-                device=self.model.device,
+        if self.scheduler.has_unfinished_sequences():
+            logger.warning(
+                "shutdown timeout reached with %d sequence(s) still in flight; aborting them",
+                len(self.scheduler.running) + len(self.scheduler.waiting),
             )
+            for seq in list(self.scheduler.running) + list(self.scheduler.waiting):
+                seq.request.is_aborted = True
+                await seq.request.finish()
+            self.scheduler.running.clear()
+            self.scheduler.waiting.clear()
 
-            kv_indices = torch.tensor(
-                blocks_to_use,
-                dtype=torch.int32,
-                device=self.model.device,
-            )
+        await self._process_loop.cancel_and_wait(timeout=5.0)
 
-            last_len = new_computed_len % self.block_size
-            kv_last_page_len = torch.tensor(
-                [last_len if last_len > 0 else self.block_size],
-                dtype=torch.int32,
-                device=self.model.device,
-            )
+        if self._metrics_task is not None:
+            self._metrics_task.cancel()
+            try:
+                await asyncio.wait_for(self._metrics_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
 
-            qo_indptr = torch.tensor(
-                [0, chunk_len],
-                dtype=torch.int32,
-                device=self.model.device,
-            )
+        logger.info("engine shutdown complete")
 
-            build_batch_indices_positions(
-                qo_indptr,
-                torch.tensor(
-                    [chunk_len],
-                    dtype=torch.int32,
-                    device=self.model.device,
-                ),
-            )
-
-            plan_prefill(
-                qo_indptr=qo_indptr,
-                kv_indptr=kv_indptr,
-                kv_indices=kv_indices,
-                kv_last_page_len=kv_last_page_len,
-                num_qo_heads=self.num_qo_heads,
-                num_kv_heads=self.num_kv_heads,
-                head_dim=self.head_dim,
-            )
-
-            input_ids = torch.tensor(
-                [chunk_ids],
-                dtype=torch.long,
-                device=self.model.device,
-            )
-
-            position_ids = torch.arange(
-                seq.computed_len,
-                new_computed_len,
-                dtype=torch.long,
-                device=self.model.device,
-            ).unsqueeze(0)
-
-            out = self.model(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                use_cache=False,
-            )
-
-            seq.computed_len = new_computed_len
-
-            if new_computed_len == len(seq.prompt_token_ids):
-                if seq.request.metrics["first_token_time"] == 0.0:
-                    seq.request.metrics["first_token_time"] = time.time()
-
-                next_token = self._sample(out.logits[0, -1].unsqueeze(0), [seq])[0]
-                seq.generated_token_ids.append(next_token)
-
-                if seq.first_token_time == 0.0:
-                    seq.first_token_time = time.time()
-
-                full_text = self.tokenizer.decode(
-                    seq.prompt_token_ids + seq.generated_token_ids,
-                    skip_special_tokens=True,
-                )
-
-                delta = full_text[len(seq.prev_text):]
-                seq.prev_text = full_text
-                outputs.append((seq, delta))
-
-                if seq.cached_prefix_len < len(seq.prompt_token_ids):
-                    prompt_blocks = math.ceil(len(seq.prompt_token_ids) / self.block_size)
-                    blocks = seq.block_table[:prompt_blocks]
-
-                    newly_cached = self.radix_cache.insert(seq.prompt_token_ids, blocks)
-                    if newly_cached:
-                        self.allocator.incref(newly_cached)
-        if decode_seqs:
-            active_decode_seqs = []
-            for seq in decode_seqs:
-                if not self._allocate_blocks_if_needed(seq):
-                    self._preempt_sequence(seq)
+    async def _log_system_metrics(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(5)
+                if not self.scheduler.has_unfinished_sequences():
                     continue
-                active_decode_seqs.append(seq)
-                
-            decode_seqs = active_decode_seqs
-            
 
-            if not decode_seqs:
-                return outputs, len(prefill_seqs) > 0
+                interval = self.metrics.flush_interval()
 
-            current_decode_batch_size = len(decode_seqs)
-            for seq in decode_seqs:
-                seq.request.metrics["decode_steps"] += 1
-                seq.request.metrics["sum_decode_batch_size"] += current_decode_batch_size
-
-            kv_indptr_list = [0]
-            kv_indices_list = []
-            kv_last_page_len_list = []
-
-            for seq in decode_seqs:
-                kv_indices_list.extend(seq.block_table)
-                kv_indptr_list.append(len(kv_indices_list))
-
-                total_len = seq.get_len
-                last_len = total_len % self.block_size
-
-                kv_last_page_len_list.append(
-                    last_len if last_len > 0 else self.block_size
+                logger.info(
+                    "[METRICS] batch=%d/%d waiting=%d cache_hit=%.1f%% "
+                    "tps=%.1f avg_prefill=%.2fms avg_decode=%.2fms",
+                    len(self.scheduler.running),
+                    self.scheduler.max_num_seqs,
+                    len(self.scheduler.waiting),
+                    self.metrics.cache_hit_rate_pct,
+                    self.metrics.current_tokens_per_second,
+                    interval["avg_prefill_ms"],
+                    interval["avg_decode_ms"],
                 )
-
-            kv_indptr = torch.tensor(
-                kv_indptr_list,
-                dtype=torch.int32,
-                device=self.model.device,
-            )
-
-            kv_indices = torch.tensor(
-                kv_indices_list,
-                dtype=torch.int32,
-                device=self.model.device,
-            )
-
-            kv_last_page_len = torch.tensor(
-                kv_last_page_len_list,
-                dtype=torch.int32,
-                device=self.model.device,
-            )
-
-            FlashInferState.batch_indices = torch.arange(
-                len(decode_seqs), dtype=torch.int32, device=self.model.device
-            )
-            
-            FlashInferState.positions = torch.tensor(
-                [seq.get_len - 1 for seq in decode_seqs],
-                dtype=torch.int32,
-                device=self.model.device
-            )
-
-            plan_decode(
-                kv_indptr=kv_indptr,
-                kv_indices=kv_indices,
-                kv_last_page_len=kv_last_page_len,
-                num_qo_heads=self.num_qo_heads,
-                num_kv_heads=self.num_kv_heads,
-                head_dim=self.head_dim,
-            )
-
-            input_ids = torch.tensor(
-                [[seq.generated_token_ids[-1]] for seq in decode_seqs],
-                dtype=torch.long,
-                device=self.model.device,
-            )
-
-            position_ids = torch.tensor(
-                [[seq.get_len - 1] for seq in decode_seqs],
-                dtype=torch.long,
-                device=self.model.device,
-            )
-
-            out = self.model(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                use_cache=False,
-            )
-
-            next_tokens = self._sample(out.logits[:, -1, :], decode_seqs)
-
-            for i, seq in enumerate(decode_seqs):
-                seq.generated_token_ids.append(next_tokens[i])
-                
-                if seq.request.metrics["first_token_time"] == 0.0:
-                    seq.request.metrics["first_token_time"] = time.time()
-
-                full_text = self.tokenizer.decode(
-                    seq.prompt_token_ids + seq.generated_token_ids,
-                    skip_special_tokens=True,
-                )
-
-                delta = full_text[len(seq.prev_text):]
-                seq.prev_text = full_text
-                outputs.append((seq, delta))
-
-        return outputs, len(prefill_seqs) > 0
+        except asyncio.CancelledError:
+            pass

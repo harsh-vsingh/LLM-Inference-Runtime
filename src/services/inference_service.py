@@ -96,7 +96,12 @@ async def stream_chat_completion(
         if not inference_req.is_aborted:
             m = inference_req.metrics
 
-            avg_batch = m["sum_decode_batch_size"] / max(m["decode_steps"], 1)
+            # NOTE: was `len(inference_req.prompt)`, which counts characters
+            # of the rendered chat-template string, not tokens. The engine
+            # is the only thing that knows the real tokenized length (it
+            # owns the tokenizer), so it populates metrics.prompt_tokens at
+            # admission time - see engine/runtime call sites.
+            prompt_tokens = m.prompt_tokens
 
             final_chunk = {
                 "id": request_id,
@@ -105,22 +110,22 @@ async def stream_chat_completion(
                 "model": model_name,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
                 "usage": {
-                    "prompt_tokens": len(inference_req.prompt),
-                    "completion_tokens": m["tokens_generated"],
-                    "total_tokens": len(inference_req.prompt) + m["tokens_generated"],
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": m.tokens_generated,
+                    "total_tokens": prompt_tokens + m.tokens_generated,
                     "optiserve_metrics": {
-                        "queue_latency": max(0.0, m["admitted_at"] - m["created_at"]),
-                        "prefill_latency": max(0.01, m["first_token_time"] - m["prefill_start"]),
-                        "decode_time": max(0.01, time.time() - m["first_token_time"]) if m["first_token_time"] > 0 else 0.0,
-                        "prefix_depth": m["prefix_depth_tokens"],
-                        "cache_blocks_reused": m["cache_blocks_reused"],
-                        "avg_decode_batch_size": round(avg_batch, 2),
-                        "ttft": max(0.01, m["first_token_time"] - m["created_at"])
+                        "queue_latency": m.queue_latency,
+                        "prefill_latency": m.prefill_latency,
+                        "decode_time": m.generation_time,
+                        "prefix_depth": m.prefix_depth_tokens,
+                        "cache_blocks_reused": m.cache_blocks_reused,
+                        "avg_decode_batch_size": round(m.avg_decode_batch_size, 2),
+                        "ttft": m.ttft,
                     }
                 }
             }
             yield f"data: {json.dumps(final_chunk)}\n\n"
-            logger.info(f"[{request_id}] stream completed ({m['tokens_generated']} tokens)")
+            logger.info(f"[{request_id}] stream completed ({m.tokens_generated} tokens)")
 
     except asyncio.CancelledError:
         inference_req.abort()

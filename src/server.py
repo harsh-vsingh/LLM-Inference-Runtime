@@ -12,6 +12,7 @@ warnings.filterwarnings("ignore", category=FutureWarning, module="bitsandbytes.*
 async def lifespan(app: FastAPI):
     app.state.engine_registry = create_engine_registry(settings.model_name, use_quantization=settings.use_quantization)
     yield
+    await app.state.engine_registry.shutdown(timeout=30.0)
 
 app = FastAPI(lifespan=lifespan)
 

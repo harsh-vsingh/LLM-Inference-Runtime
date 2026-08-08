@@ -6,8 +6,10 @@ from api.schemas import ChatCompletionRequest, EngineConfigUpdate
 from api.dependencies import get_engine_registry, get_engine
 from services.engine_registry import EngineRegistry
 from engine.async_engine import AsyncInferenceEngine
+from engine.errors import AdmissionError
 from services import inference_service
 from services import admin_service
+from services.admin_service import CacheClearBlockedError
 from services import metrics_service
 from core.logging import get_logger
 
@@ -32,6 +34,13 @@ async def chat_completions(
 
     try:
         request_id, inference_req = await inference_service.submit_chat_completion(engine, req)
+    except AdmissionError as e:
+        logger.info(f"Request rejected at admission: {e.reason.value}")
+        status_code = 503 if e.is_retryable else 400
+        raise HTTPException(
+            status_code=status_code,
+            detail={"message": e.message, "reason": e.reason.value, "retryable": e.is_retryable},
+        )
     except Exception:
         logger.exception("Failed to submit chat completion request")
         raise HTTPException(status_code=500, detail="Failed to process request.")
@@ -77,6 +86,8 @@ async def update_engine_config(
 ):
     try:
         admin_service.update_config(engine, config)
+    except CacheClearBlockedError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except Exception:
         logger.exception("Failed to update engine config")
         raise HTTPException(status_code=500, detail="Failed to update engine config.")

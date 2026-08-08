@@ -1,6 +1,7 @@
 import asyncio
-import time
-from typing import Dict, Any
+
+from engine.metrics.request_metrics import RequestMetrics
+
 
 class InferenceRequest:
     def __init__(
@@ -16,40 +17,23 @@ class InferenceRequest:
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
-        
-        self.output_queue = asyncio.Queue()
-        
+
+        self.output_queue: asyncio.Queue = asyncio.Queue()
+
         self.is_finished = False
         self.is_aborted = False
 
-        # --- ADVANCED TELEMETRY ---
-        self.metrics: Dict[str, Any] = {
-            "created_at": time.time(),
-            "admitted_at": 0.0,
-            "prefill_start": 0.0,
-            "first_token_time": 0.0,
-            "finished_at": 0.0,
-            "tokens_generated": 0,
-            
-            "prefix_depth_tokens": 0,
-            "cache_blocks_reused": 0,
-            
-            "decode_steps": 0,
-            "sum_decode_batch_size": 0,
-        }
+        self.metrics = RequestMetrics()
 
-    def abort(self):
+    def abort(self) -> None:
         self.is_aborted = True
-        self.metrics["finished_at"] = time.time()
+        self.metrics.record_finished()
 
-    async def put_token(self, token: str):
-        if self.metrics["first_token_time"] == 0.0:
-            self.metrics["first_token_time"] = time.time()
-            
-        self.metrics["tokens_generated"] += 1
+    async def put_token(self, token: str) -> None:
+        self.metrics.record_token_generated()
         await self.output_queue.put(token)
-        
-    async def finish(self):
+
+    async def finish(self) -> None:
         self.is_finished = True
-        self.metrics["finished_at"] = time.time()
+        self.metrics.record_finished()
         await self.output_queue.put(None)
