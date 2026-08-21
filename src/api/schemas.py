@@ -52,6 +52,5 @@ class ChatCompletionStreamResponse(BaseModel):
 
 class EngineConfigUpdate(BaseModel):
     ENABLE_PREFIX_CACHE: bool | None = None
-    ENABLE_CONTINUOUS_BATCHING: bool | None = None
     ENABLE_CHUNKED_PREFILL: bool | None = None
     CLEAR_CACHE: bool = False

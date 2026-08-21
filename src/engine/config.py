@@ -1,40 +1,44 @@
-from collections.abc import Iterator, MutableMapping
-from dataclasses import dataclass, fields
+"""
+Engine configuration.
+"""
+from dataclasses import dataclass
 from typing import Any
 
 
-_LEGACY_KEY_MAP = {
-    "ENABLE_PREFIX_CACHE": "enable_prefix_cache",
-    "ENABLE_CONTINUOUS_BATCHING": "enable_continuous_batching",
-    "ENABLE_CHUNKED_PREFILL": "enable_chunked_prefill",
-}
-
-
 @dataclass
-class EngineConfig(MutableMapping):
-    enable_continuous_batching: bool = True
+class EngineConfig():
     enable_chunked_prefill: bool = True
     enable_prefix_cache: bool = True
+
+    # Tokens per KV cache block. Fixed at engine construction time
+    block_size: int = 16
+
+    # Number of KV cache blocks the allocator owns. This default is a
+    # fallback only, used when hardware-derived sizing is unavailable.
+    num_blocks: int = 4096
+
+    # Hard cap on (waiting + running) sequences. This bounds how 
+    # much work can be queued 
+
     max_queue_depth: int = 512
+
+    # How long a request may sit admitted-but-not-running before it's
+    # failed with QUEUE_TIMEOUT. measured cumulatively from 
+    # the request's original arrival time (not reset on preemption)
     max_queue_wait_seconds: float = 120.0
+
+    # How many times a running sequence may be preempted
     max_preemption_retries: int = 3
+
+    # Sequences past this fraction of their max_new_tokens are excluded
+    # from preemption, except when every running sequence is above the threshold,
+    # case protection is waived to avoid deadlocking then.
+    completion_protection_threshold: float = 0.8
+
+    # Cache only eviction fires when free blocks drop below
+    # min(eviction_low_water_blocks, eviction_low_water_pct * total_blocks)
+    eviction_low_water_blocks: int = 64
+    eviction_low_water_pct: float = 0.1
+
+    # Prefill chunk size cap per sequence per step.
     max_chunk_size: int = 512
-
-    def __getitem__(self, key: str) -> Any:
-        attr = _LEGACY_KEY_MAP.get(key, key)
-        return getattr(self, attr)
-
-    def __setitem__(self, key: str, value: Any) -> None:
-        attr = _LEGACY_KEY_MAP.get(key, key)
-        if not hasattr(self, attr):
-            raise KeyError(f"Unknown engine config key: {key!r}")
-        setattr(self, attr, value)
-
-    def __delitem__(self, key: str) -> None:
-        raise TypeError("EngineConfig keys cannot be deleted, only reassigned")
-
-    def __iter__(self) -> Iterator[str]:
-        return iter(f.name for f in fields(self))
-
-    def __len__(self) -> int:
-        return len(fields(self))

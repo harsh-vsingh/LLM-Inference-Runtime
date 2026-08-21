@@ -63,6 +63,7 @@ class ModelLoader:
 
 
 def get_model_loader(model_name: str, use_quantization: bool = False, torch_dtype: torch.dtype = torch.float16) -> ModelLoader:
+    use_quantization = False
     model_loader = ModelLoader(model_name, use_quantization, torch_dtype)
     model_loader.load_model()
     return model_loader

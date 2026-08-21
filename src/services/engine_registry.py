@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 class EngineRegistry:
-    def __init__(self, model_name: str, use_quantization: bool = True):
+    def __init__(self, model_name: str, use_quantization: bool = settings.use_quantization):
         self._model_name = model_name
         self._use_quantization = use_quantization
         self._engine: Optional[AsyncInferenceEngine] = None
@@ -26,7 +26,6 @@ class EngineRegistry:
         engine = AsyncInferenceEngine(
             model,
             tokenizer,
-            max_num_seqs=settings.max_num_seqs,
             max_num_batched_tokens=settings.max_num_batched_tokens,
         )
         engine.start()
@@ -74,7 +73,9 @@ class EngineRegistry:
         return self._model_name
 
 
-def create_engine_registry(model_name: str, use_quantization: bool = True) -> EngineRegistry:
+def create_engine_registry(
+    model_name: str, use_quantization: bool = settings.use_quantization
+) -> EngineRegistry:
     registry = EngineRegistry(model_name, use_quantization=use_quantization)
     registry.load()
     return registry

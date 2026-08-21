@@ -8,8 +8,8 @@ from engine.memory.allocator import BlockAllocator
 from engine.memory.radix_cache import RadixCache
 from engine.metrics.engine_metrics import EngineMetrics
 from engine.runtime.step_executor import StepExecutor
-from engine.scheduling.scheduler import Scheduler
-from engine.sequence import Sequence
+from engine.scheduling.admission_controller import AdmissionController
+from engine.sequence import Sequence, SequenceStatus
 
 logger = logging.getLogger(__name__)
 
@@ -17,13 +17,12 @@ logger = logging.getLogger(__name__)
 class ProcessLoop:
     def __init__(
         self,
-        scheduler: Scheduler,
+        scheduler: AdmissionController,
         step_executor: StepExecutor,
         allocator: BlockAllocator,
         radix_cache: RadixCache,
         engine_metrics: EngineMetrics,
         block_size: int,
-        chunked_prefill_enabled_fn,
     ):
         self.scheduler = scheduler
         self.step_executor = step_executor
@@ -31,7 +30,6 @@ class ProcessLoop:
         self.radix_cache = radix_cache
         self.engine_metrics = engine_metrics
         self.block_size = block_size
-        self._chunked_prefill_enabled_fn = chunked_prefill_enabled_fn
 
         self.wakeup_event = asyncio.Event()
         self._stopping = False
@@ -63,6 +61,8 @@ class ProcessLoop:
                     if self._stopping and not self.scheduler.running:
                         break
 
+                    await self._expire_timed_out_waiting()
+
                     now = time.time()
                     for seq in self.scheduler.running:
                         seq.request.metrics.record_admitted()
@@ -76,25 +76,61 @@ class ProcessLoop:
         except asyncio.CancelledError:
             raise
 
+    async def _expire_timed_out_waiting(self) -> None:
+        expire_fn = getattr(self.scheduler, "expire_timed_out_waiting", None)
+        if expire_fn is None:
+            return
+
+        expired = expire_fn()
+        for seq in expired:
+            seq.request.is_aborted = True
+            self.step_executor.drop_detokenizer(seq)
+            logger.info(
+                "request %s timed out in queue after %.1fs",
+                seq.request.request_id,
+                time.time() - seq.request.metrics.created_at,
+            )
+            await seq.request.finish()
+
     async def _run_one_step(self, now: float) -> None:
-        prefill_seqs, decode_seqs = self.scheduler.step()
+        prefill_seqs, prefill_chunk_lens, decode_seqs, preempted = self.scheduler.step()
+
+        # Preemption already happened synchronously inside scheduler.step()
+        # (on the event loop, before any worker-thread dispatch) - handle
+        # it here rather than waiting for run_step's result, since
+        # StepExecutor no longer preempts anything itself.
+        for seq in preempted:
+            if seq.request.is_aborted:
+                # Preemption retry budget was exhausted - AdmissionController
+                # ._fail_preempted_sequence already did all teardown
+                # (decref, list removal, detokenizer drop, aborted-request
+                # metric) synchronously inside scheduler.step(). All that's
+                # left is calling finish() on the request, since nothing
+                # else will ever call it - without this, the client's
+                # output stream would hang forever waiting for a sentinel
+                # that never arrives.
+                await seq.request.finish()
 
         try:
             step_start = time.time()
             result = await asyncio.to_thread(
                 self.step_executor.run_step,
                 prefill_seqs,
+                prefill_chunk_lens,
                 decode_seqs,
-                self._chunked_prefill_enabled_fn(),
             )
             step_duration = time.time() - step_start
 
             self.engine_metrics.record_step(
                 step_duration, result.is_prefill, len(result.outputs)
             )
-            if result.preempted:
-                for _ in result.preempted:
-                    self.engine_metrics.record_preemption()
+
+            # StepExecutor can't touch radix_cache itself (worker thread) -
+            # it just reports which sequences finished their prefill this
+            # step, and we insert them into the cache here, back on the
+            # event loop.
+            for seq, prompt_token_ids, blocks in result.finished_prefills:
+                self.radix_cache.insert(prompt_token_ids, blocks)
 
             for seq, new_text in result.outputs:
                 await seq.request.put_token(new_text)
@@ -110,6 +146,20 @@ class ProcessLoop:
             await asyncio.sleep(0.1)
 
     async def _finish_sequence(self, seq: Sequence) -> None:
+        # Status/list-membership bookkeeping happens here, immediately
+        # alongside resource teardown, rather than being left for
+        # AdmissionController.step()'s cleanup pass on the *next* step.
+        # Deferring it left a window - after this function tears down
+        # block_table/radix-cache state but before the next step() call -
+        # where seq sat in self.scheduler.running fully torn down (empty
+        # block_table, already cache-inserted) yet still nominally
+        # RUNNING. Anything reading `running` in that window (metrics
+        # snapshots from a concurrent get_metrics() call, a future
+        # preemption/eviction algorithm) would see a phantom sequence.
+        seq.status = SequenceStatus.FINISHED
+        if seq in self.scheduler.running:
+            self.scheduler.running.remove(seq)
+
         seq.request.metrics.record_finished()
 
         full_tokens = seq.prompt_token_ids + seq.generated_token_ids
@@ -133,7 +183,7 @@ class ProcessLoop:
             "ttft=%.4fs tpot=%.4fs throughput=%.2f tok/s",
             seq.request.request_id,
             seq.request.metrics.tokens_generated,
-            len(seq.prompt_token_ids),
+            seq.original_prompt_len,
             seq.request.metrics.ttft,
             seq.request.metrics.tpot,
             seq.request.metrics.throughput,

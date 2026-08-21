@@ -1,25 +1,10 @@
 """
 Prefix-caching radix tree over KV blocks.
-
-Fix vs. the original radix_cache.py: this class now owns an allocator
-reference and manages ref-counts internally for every operation that
-creates or removes a cache entry. Previously, callers were responsible for
-manually calling allocator.incref()/decref() in lockstep with every
-match_prefix()/insert()/evict_lru() call - repeated at 6 separate call
-sites in async_engine.py. Forgetting the paired call at any one of those
-sites would silently corrupt either the cache's view of what's alive or
-the allocator's free list. Folding the ref-count management in here makes
-that class of bug structurally impossible: there is exactly one place that
-increfs on cache insert/match and decrefs on cache eviction.
-
-match_prefix() increfs the matched blocks, because the caller is about to
-attach them to a sequence's block_table (i.e. the sequence now holds a
-reference). This mirrors what every call site did manually before.
+match_prefix() increfs the matched blocks.
 """
 
 import time
 from typing import Dict, List, Optional, Tuple
-
 from engine.memory.allocator import BlockAllocator
 
 
@@ -43,9 +28,7 @@ class RadixCache:
     def match_prefix(self, tokens: List[int]) -> Tuple[List[int], List[int]]:
         """
         Returns (matched_tokens, matched_blocks) for the longest cached
-        prefix of `tokens`. The matched blocks are increfed on the
-        caller's behalf - the caller is expected to attach them to a
-        sequence's block_table, i.e. take ownership of that reference.
+        prefix of `tokens`. The matched blocks are increfed.
         """
         node = self.root
         matched_tokens: List[int] = []
@@ -68,24 +51,16 @@ class RadixCache:
 
     def reset(self) -> None:
         """
-        Clears the cache tree structure only. Does NOT touch allocator
-        ref-counts - any blocks referenced by this tree are still owned by
-        whatever sequences currently hold them in their block_table, and
-        will be released normally via those sequences' own decref on
-        finish. This mirrors the pre-existing benchmarking use in
-        admin_service.py (CLEAR_CACHE), which pairs this with a separate,
-        explicit allocator.free_all() call for the full reset - that call
-        now independently refuses to run if anything is still live (see
-        BlockAllocator.free_all).
+        Clears the cache tree structure only. Does not modify allocator
+        ref-counts. To clear the underlying KV cache as well, call
+        BlockAllocator.free_all(force=True) after this method.
         """
         self.root = RadixNode()
 
     def insert(self, tokens: List[int], block_table: List[int]) -> List[int]:
         """
-        Inserts `tokens`/`block_table` into the cache tree. Newly-created
-        cache entries are increfed on the allocator (the cache now holds a
-        reference to them, in addition to whichever sequence already
-        holds one from having computed them).
+        Inserts `tokens`/`block_table` into the cache tree.
+        Newly created cache entries are increfed.
         """
         node = self.root
         newly_inserted: List[int] = []
@@ -112,37 +87,25 @@ class RadixCache:
 
         return newly_inserted
 
-    def _collect_leaf_nodes(
-        self,
-        node: Optional[RadixNode] = None,
-        leaves: Optional[List[RadixNode]] = None,
-    ) -> List[RadixNode]:
-        if node is None:
-            node = self.root
-        if leaves is None:
-            leaves = []
+    def _collect_leaf_nodes(self) -> List[RadixNode]:
+        leaves: List[RadixNode] = []
+        stack = list(self.root.children.values())
 
-        if node is not self.root and not node.children:
-            leaves.append(node)
+        while stack:
+            node = stack.pop()
 
-        for child in node.children.values():
-            self._collect_leaf_nodes(child, leaves)
+            if not node.children:
+                leaves.append(node)
+            else:
+                stack.extend(node.children.values())
 
         return leaves
 
     def evict_lru(self, num_blocks: int) -> List[int]:
         """
-        Evicts up to `num_blocks` least-recently-used blocks from the
-        cache tree and decrefs them on the allocator. Only evicts blocks
-        whose allocator ref_count is exactly 1, i.e. blocks held ONLY by
-        the cache and not currently in use by any running sequence -
-        evicting a block a live sequence still needs would corrupt that
-        sequence's KV state.
-
-        Note: no longer takes ref_counts as a parameter (the original
-        signature required the caller to reach into
-        `self.allocator.ref_counts` and pass it in) - this class now owns
-        its allocator reference, so it reads that state itself.
+        Evicts up to num_blocks lru blocks from the
+        cache tree and decrefs them on the allocator. Only 
+        evicts blocks whose allocator ref_count is exactly 1
         """
         if num_blocks <= 0:
             return []

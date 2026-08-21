@@ -1,6 +1,10 @@
+"""
+A single generation sequence (one request's token 
+stream through the scheduler/engine).
+"""
+
 from enum import Enum
 from typing import List
-
 from engine.request import InferenceRequest
 
 
@@ -19,6 +23,7 @@ class Sequence:
     ):
         self.request = request
         self.prompt_token_ids = prompt_token_ids
+        self.original_prompt_len = len(prompt_token_ids)
         self.generated_token_ids: List[int] = []
         self.eos_token_id = eos_token_id
 

@@ -11,11 +11,9 @@ class CacheClearBlockedError(Exception):
 
 def update_config(engine: AsyncInferenceEngine, config: EngineConfigUpdate) -> None:
     if config.ENABLE_PREFIX_CACHE is not None:
-        engine.config["ENABLE_PREFIX_CACHE"] = config.ENABLE_PREFIX_CACHE
-    if config.ENABLE_CONTINUOUS_BATCHING is not None:
-        engine.config["ENABLE_CONTINUOUS_BATCHING"] = config.ENABLE_CONTINUOUS_BATCHING
+        engine.config.enable_prefix_cache = config.ENABLE_PREFIX_CACHE
     if config.ENABLE_CHUNKED_PREFILL is not None:
-        engine.config["ENABLE_CHUNKED_PREFILL"] = config.ENABLE_CHUNKED_PREFILL
+        engine.config.enable_chunked_prefill = config.ENABLE_CHUNKED_PREFILL
     if config.CLEAR_CACHE:
         clear_cache(engine)
 
