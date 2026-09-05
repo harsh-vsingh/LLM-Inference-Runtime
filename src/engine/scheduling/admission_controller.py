@@ -1,6 +1,5 @@
 import math
 import time
-from typing import Dict, List, Optional, Tuple
 
 from engine.config import EngineConfig
 from engine.errors import AdmissionError, AdmissionRejectReason
@@ -51,10 +50,10 @@ class AdmissionController:
         self._drop_detokenizer_fn = drop_detokenizer_fn
         self._engine_metrics = engine_metrics
 
-        self.waiting: List[Sequence] = []
-        self.running: List[Sequence] = []
+        self.waiting: list[Sequence] = []
+        self.running: list[Sequence] = []
 
-        self._preempted_this_step: List[Sequence] = []
+        self._preempted_this_step: list[Sequence] = []
 
     def add_sequence(self, seq: Sequence) -> None:
         self._check_admission(seq)
@@ -72,12 +71,12 @@ class AdmissionController:
                 f"KV capacity of {total_kv_tokens} tokens on this engine",
             )
 
-    def _reject(self, reason: AdmissionRejectReason, message: Optional[str] = None) -> None:
+    def _reject(self, reason: AdmissionRejectReason, message: str | None = None) -> None:
         if self._on_reject is not None:
             self._on_reject(reason)
         raise AdmissionError(reason, message)
 
-    def expire_timed_out_waiting(self) -> List[Sequence]:
+    def expire_timed_out_waiting(self) -> list[Sequence]:
         """
         Removes and returns waiting sequences that have exceeded
         max_queue_wait_seconds, measured from the request's
@@ -97,22 +96,10 @@ class AdmissionController:
             self.waiting = [s for s in self.waiting if id(s) not in expired_ids]
         return expired
 
-    def step(self) -> Tuple[List[Sequence], Dict[int, int], List[Sequence], List[Sequence]]:
+    def step(self) -> tuple[list[Sequence], dict[int, int], list[Sequence], list[Sequence]]:
         """
         Returns (prefill_seqs, chunk_lens, decode_seqs, preempted).
-
-        preempted lists every sequence this call preempted, across all
-        three reservation sites (running-decode reservation,
-        running-prefill reservation, new-prefill admission). All block
-        allocation for the step is finalized before this returns.
-
-        Two-phase global reservation:
-          Phase 1 - reserve for everything already RUNNING (decode
-          cost for every running seq, plus the next chunk for every
-          running seq still mid-prefill). Neither is optional or
-          skippable this step.
-          Phase 2 - spend whatever token budget remains admitting new
-          prefill from `waiting`.
+        Preempted lists every sequence this call preempted.
         """
         self._preempted_this_step = []
 
@@ -137,7 +124,7 @@ class AdmissionController:
 
         max_chunk = self.config.max_chunk_size if self.config.enable_chunked_prefill else 10 ** 9
 
-        chunk_lens: Dict[int, int] = {}
+        chunk_lens: dict[int, int] = {}
         for seq in in_progress_prefill:
             chunk_len = min(
                 len(seq.prompt_token_ids) - seq.computed_len,
@@ -147,13 +134,6 @@ class AdmissionController:
             chunk_lens[id(seq)] = chunk_len
             remaining_budget -= chunk_len
 
-        # --- Phase 1: reserve for everything already running ---
-        # Decode first (cheaper, never skippable), then in-progress
-        # prefill chunks - both computed as batched totals so the
-        # deficit (if any) is known globally before we evict/preempt,
-        # rather than resolving seq-by-seq and risking one seq's
-        # reservation preempting another seq we're about to reserve for
-        # in the very same phase.
         failed_decode = self._reserve_blocks_for_running_decode(decode_seqs)
         if failed_decode:
             failed_ids = {id(s) for s in failed_decode}
@@ -163,22 +143,15 @@ class AdmissionController:
         for seq in in_progress_prefill:
             chunk_len = chunk_lens.get(id(seq), 0)
             if not self._reserve_blocks_for_prefill_chunk(seq, chunk_len):
-                # Sequence already RUNNING and mid-prefill but couldn't
-                # get its next chunk's blocks even after eviction and
-                # preemption of *other* running sequences - preempt it
-                # too, same as a failed decode reservation. There's no
-                # "just skip it this step" option once something is
-                # RUNNING.
+
                 self._preempt(seq)
                 failed_prefill_ids.add(id(seq))
 
-        prefill_seqs: List[Sequence] = [
+        prefill_seqs: list[Sequence] = [
             seq for seq in in_progress_prefill if id(seq) not in failed_prefill_ids
         ]
         seen_ids = {id(s) for s in prefill_seqs}
 
-        # --- Phase 2: admit new prefill from `waiting` with whatever
-        # budget is left over ---
         if remaining_budget > 0:
             admitted, admitted_chunk_lens = self._admit_prefill(remaining_budget)
             for seq in admitted:
@@ -211,7 +184,7 @@ class AdmissionController:
         evicted = self.radix_cache.evict_lru(deficit)
         return len(evicted)
 
-    def _admit_prefill(self, budget: int) -> Tuple[List[Sequence], Dict[int, int]]:
+    def _admit_prefill(self, budget: int) -> tuple[list[Sequence], dict[int, int]]:
         """
         Iterates self.waiting by sequence identity - reservation can
         trigger preemption of a running sequence, which inserts that
@@ -219,8 +192,8 @@ class AdmissionController:
         """
         max_chunk = self.config.max_chunk_size if self.config.enable_chunked_prefill else 10 ** 9
 
-        admitted: List[Sequence] = []
-        chunk_lens: Dict[int, int] = {}
+        admitted: list[Sequence] = []
+        chunk_lens: dict[int, int] = {}
         used = 0
 
         candidates = list(self.waiting)
@@ -259,22 +232,7 @@ class AdmissionController:
     def _reserve_blocks_for_prefill_chunk(self, seq: Sequence, chunk_len: int) -> bool:
         """
         Ensures blocks are available AND ASSIGNED for the next
-        chunk_len tokens of seq before it's included in this step's
-        prefill batch:
-
-          1. Cache-only eviction
-          2. If still insufficient, preempt already-running sequences
-          3. Commit: extend seq.block_table with the newly allocated
-             blocks
-
-        Step 3 is the fix for the double-booking gap this used to have:
-        previously this only checked/evicted for availability
-        (try_allocate) without ever calling allocator.allocate() to
-        commit blocks into block_table, so two different waiting seqs
-        could each pass the check against the same free pool and only
-        one would actually get usable blocks by the time StepExecutor
-        read block_table. Now the commit happens here, atomically with
-        the check, before this seq is ever returned as admitted.
+        chunk_len tokens of seq.
         """
         logical_blocks_needed = (
             math.ceil((seq.computed_len + chunk_len) / self.block_size) - len(seq.block_table)
@@ -302,7 +260,7 @@ class AdmissionController:
         seq.block_table.extend(self.allocator.allocate(logical_blocks_needed))
         return True
 
-    def _reserve_blocks_for_running_decode(self, decode_seqs: List[Sequence]) -> List[Sequence]:
+    def _reserve_blocks_for_running_decode(self, decode_seqs: list[Sequence]) -> list[Sequence]:
         """
         Reserves, in a single batched pass, whatever new blocks the
         decode batch needs for this step's token
@@ -311,7 +269,7 @@ class AdmissionController:
         Returns the subset of decode_seqs that still couldn't get a
         block; those have already been preempted by this call
         """
-        needs: Dict[int, int] = {}
+        needs: dict[int, int] = {}
         total_needed = 0
         for seq in decode_seqs:
             required_blocks = math.ceil((seq.get_len + 1) / self.block_size)
@@ -336,7 +294,7 @@ class AdmissionController:
                     self._preempt(victim)
                     needs.pop(id(victim), None)
 
-        failed: List[Sequence] = []
+        failed: list[Sequence] = []
         for seq in decode_seqs:
             need = needs.get(id(seq))
             if not need:
@@ -350,19 +308,7 @@ class AdmissionController:
         return failed
 
     def _preempt(self, seq: Sequence) -> None:
-        """
-        The single preemption entry point - every one of the three
-        reservation sites above (running-decode, running-prefill,
-        new-prefill-admission-evicting-a-victim) calls this and only
-        this, rather than each duplicating the reset/requeue/fail
-        logic. Also the single place step() records that a preemption
-        happened, via _preempted_this_step, regardless of which site
-        triggered it.
 
-        Runs seq's preemption-count check; on repeated failure past
-        max_preemption_retries, hard-fails the sequence instead of
-        requeuing it (see _fail_preempted_sequence).
-        """
         seq.request.metrics.record_preemption()
         self._preempted_this_step.append(seq)
         if self._engine_metrics is not None:
@@ -399,18 +345,8 @@ class AdmissionController:
     def _fail_preempted_sequence(self, seq: Sequence) -> None:
         """
         A sequence that has exhausted its preemption retry budget is
-        hard-aborted rather than requeued again. This bypasses the
-        normal ProcessLoop._finish_sequence teardown (the sequence
-        never runs another step to reach it), so this method must do
-        the equivalent bookkeeping itself:
-          - decref its blocks
-          - remove it from running/waiting
-          - drop its detokenizer (nothing will read it again)
-          - mark the request aborted
-          - record it as a dedicated aborted-request metric, NOT as a
-            successful record_finished_request - doing the latter
-            would pollute TTFT/TPOT averages with a request that never
-            actually finished generating.
+        aborted. Bypasses the normal ProcessLoop._finish_sequence
+        so does the equivalent bookkeeping itself:
         """
         if seq.block_table:
             self.allocator.decref(seq.block_table)

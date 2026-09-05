@@ -1,17 +1,17 @@
 import time
-from fastapi import APIRouter, Request, Depends, HTTPException
+from typing import Any
+
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
-from typing import Dict, Any
+
+from api.dependencies import get_engine, get_engine_registry
 from api.schemas import ChatCompletionRequest, EngineConfigUpdate
-from api.dependencies import get_engine_registry, get_engine
-from services.engine_registry import EngineRegistry
+from core.logging import get_logger
 from engine.async_engine import AsyncInferenceEngine
 from engine.errors import AdmissionError
-from services import inference_service
-from services import admin_service
+from services import admin_service, inference_service, metrics_service
 from services.admin_service import CacheClearBlockedError
-from services import metrics_service
-from core.logging import get_logger
+from services.engine_registry import EngineRegistry
 
 router = APIRouter()
 logger = get_logger(__name__)
@@ -59,7 +59,7 @@ async def chat_completions(
 
 
 @router.post("/v1/completions")
-async def completions(request: Dict[str, Any]):
+async def completions(request: dict[str, Any]):
     raise HTTPException(
         status_code=501,
         detail="The /v1/completions endpoint is not implemented.",
@@ -67,7 +67,7 @@ async def completions(request: Dict[str, Any]):
 
 
 @router.get("/v1/models")
-async def list_models(registry: EngineRegistry = Depends(get_engine_registry)) -> Dict[str, Any]:
+async def list_models(registry: EngineRegistry = Depends(get_engine_registry)) -> dict[str, Any]:
     return {
         "object": "list",
         "data": [{

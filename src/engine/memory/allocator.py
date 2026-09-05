@@ -2,8 +2,9 @@
 KV cache block allocator.
 """
 
-from typing import List
+
 import torch
+
 from engine.errors import BlockAllocationError
 
 
@@ -34,7 +35,7 @@ class BlockAllocator:
             device=device,
         )
 
-        self.free_blocks: List[int] = list(range(num_blocks))
+        self.free_blocks: list[int] = list(range(num_blocks))
         self.ref_counts = [0] * num_blocks
 
     def try_allocate(self, num_blocks_needed: int, radix_cache=None) -> bool:
@@ -52,7 +53,7 @@ class BlockAllocator:
 
         return len(self.free_blocks) >= num_blocks_needed
 
-    def allocate(self, num_blocks_needed: int) -> List[int]:
+    def allocate(self, num_blocks_needed: int) -> list[int]:
         if num_blocks_needed <= 0:
             return []
 
@@ -70,11 +71,11 @@ class BlockAllocator:
 
         return allocated
 
-    def incref(self, blocks: List[int]) -> None:
+    def incref(self, blocks: list[int]) -> None:
         for block in blocks:
             self.ref_counts[block] += 1
 
-    def decref(self, blocks: List[int]) -> None:
+    def decref(self, blocks: list[int]) -> None:
         for block in blocks:
             if self.ref_counts[block] <= 0:
                 raise BlockAllocationError(

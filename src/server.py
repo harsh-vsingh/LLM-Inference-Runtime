@@ -1,11 +1,13 @@
+import warnings
 from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from api.routes import router
-from services.engine_registry import create_engine_registry
-from core.config import settings
 
-import warnings
+from api.routes import router
+from core.config import settings
+from services.engine_registry import create_engine_registry
+
 warnings.filterwarnings("ignore", category=FutureWarning, module="bitsandbytes.*")
 
 @asynccontextmanager

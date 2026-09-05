@@ -2,11 +2,10 @@
 Engine configuration.
 """
 from dataclasses import dataclass
-from typing import Any
 
 
 @dataclass
-class EngineConfig():
+class EngineConfig:
     enable_chunked_prefill: bool = True
     enable_prefix_cache: bool = True
 

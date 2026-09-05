@@ -1,4 +1,4 @@
-from typing import List
+
 from engine.memory.allocator import BlockAllocator
 from engine.sequence import Sequence
 
@@ -15,11 +15,11 @@ def _exclusive_block_count(seq: Sequence, allocator: BlockAllocator) -> int:
 
 
 def select_preemption_victims(
-    running_seqs: List[Sequence],
+    running_seqs: list[Sequence],
     blocks_needed: int,
     allocator: BlockAllocator,
     completion_protection_threshold: float = 0.8,
-) -> List[Sequence]:
+) -> list[Sequence]:
     """
     Chooses which running sequences to preempt to free at least
     blocks_needed blocks, minimizing wasted work.
@@ -59,7 +59,7 @@ def select_preemption_victims(
     else:
         eligible.sort(key=lambda pair: pair[1], reverse=True)
 
-    victims: List[Sequence] = []
+    victims: list[Sequence] = []
     freed = 0
     for seq, yield_ in eligible:
         if freed >= blocks_needed:

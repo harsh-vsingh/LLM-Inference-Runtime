@@ -3,6 +3,7 @@ Derives KV cache capacity from GPU memory.
 """
 
 import logging
+
 import torch
 
 logger = logging.getLogger(__name__)

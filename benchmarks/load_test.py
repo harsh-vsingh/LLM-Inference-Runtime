@@ -30,7 +30,6 @@ import json
 import random
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional
 
 import aiohttp
 
@@ -90,9 +89,9 @@ def load_prompts(file_path: str, count: int = PROMPT_POOL_SIZE):
 
 def build_request_plan(
     short_prompts, long_prompts, rate_rps: float, duration_seconds: float
-) -> List[PlannedRequest]:
+) -> list[PlannedRequest]:
     rng = random.Random(SEED)
-    plan: List[PlannedRequest] = []
+    plan: list[PlannedRequest] = []
 
     t = 0.0
     interval = 1.0 / rate_rps
@@ -140,7 +139,7 @@ class Stats:
     # Timestamps (seconds since run start) of every non-completed outcome,
     # so failures can be correlated against a server-side metrics timeline
     # (e.g. OptiServe's /metrics KV-utilization curve) after the fact.
-    failure_log: List[str] = field(default_factory=list)
+    failure_log: list[str] = field(default_factory=list)
 
     def accounted_for(self) -> int:
         return (
@@ -191,7 +190,7 @@ async def fire_request(
     }
 
     start = time.time()
-    first_token_time: Optional[float] = None
+    first_token_time: float | None = None
     generated_tokens = 0
 
     def log_failure(kind: str, detail: str = ""):
@@ -264,7 +263,7 @@ async def reporter(label: str, stats: Stats, start_time: float, stop_event: asyn
     while not stop_event.is_set():
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=REPORT_INTERVAL_SECONDS)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
         elapsed = time.time() - start_time
@@ -281,7 +280,7 @@ async def reporter(label: str, stats: Stats, start_time: float, stop_event: asyn
         )
 
 
-async def run_load_plan(label: str, url: str, model_name: str, plan: List[PlannedRequest]) -> Stats:
+async def run_load_plan(label: str, url: str, model_name: str, plan: list[PlannedRequest]) -> Stats:
     stats = Stats()
     start_time = time.time()
     stop_event = asyncio.Event()

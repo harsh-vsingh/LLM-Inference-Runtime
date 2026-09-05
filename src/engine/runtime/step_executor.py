@@ -1,6 +1,5 @@
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Tuple
 
 import torch
 
@@ -13,13 +12,14 @@ from models.llama import (
     plan_prefill,
 )
 
+
 @dataclass
 class StepResult:
-    outputs: List[Tuple[Sequence, str]] = field(default_factory=list)
+    outputs: list[tuple[Sequence, str]] = field(default_factory=list)
     is_prefill: bool = False
     # (seq, prompt_token_ids, blocks) for sequences that finished their
     # prefill this step and need inserting into the radix cache.
-    finished_prefills: List[Tuple[Sequence, List[int], List[int]]] = field(default_factory=list)
+    finished_prefills: list[tuple[Sequence, list[int], list[int]]] = field(default_factory=list)
 
 
 class StepExecutor:
@@ -43,7 +43,7 @@ class StepExecutor:
         self.head_dim = head_dim
         self._sample = sampler
 
-        self._detokenizers: Dict[str, IncrementalDetokenizer] = {}
+        self._detokenizers: dict[str, IncrementalDetokenizer] = {}
 
     def _get_detokenizer(self, seq: Sequence) -> IncrementalDetokenizer:
         key = seq.request.request_id
@@ -58,12 +58,12 @@ class StepExecutor:
 
     def run_step(
         self,
-        prefill_seqs: List[Sequence],
-        prefill_chunk_lens: Dict[int, int],
-        decode_seqs: List[Sequence],
+        prefill_seqs: list[Sequence],
+        prefill_chunk_lens: dict[int, int],
+        decode_seqs: list[Sequence],
     ) -> StepResult:
         """
-        prefill_seqs/decode_seqs are assumed already admitted - i.e.
+        prefill_seqs/decode_seqs are assumed already admitted i.e.
         AdmissionController.step() has already ensured each seq's
         block_table has enough blocks for this step's tokens.
         """
@@ -81,19 +81,19 @@ class StepExecutor:
 
     def _run_prefill(
         self,
-        prefill_seqs: List[Sequence],
-        prefill_chunk_lens: Dict[int, int],
+        prefill_seqs: list[Sequence],
+        prefill_chunk_lens: dict[int, int],
         result: StepResult,
-    ) -> List[Tuple[Sequence, str]]:
+    ) -> list[tuple[Sequence, str]]:
         device = self.model.device
 
-        active_seqs: List[Sequence] = []
-        chunk_ids_list: List[List[int]] = []
-        chunk_lens: List[int] = []
-        new_computed_lens: List[int] = []
-        blocks_per_seq: List[List[int]] = []
-        last_page_lens: List[int] = []
-        position_id_ranges: List[Tuple[int, int]] = []
+        active_seqs: list[Sequence] = []
+        chunk_ids_list: list[list[int]] = []
+        chunk_lens: list[int] = []
+        new_computed_lens: list[int] = []
+        blocks_per_seq: list[list[int]] = []
+        last_page_lens: list[int] = []
+        position_id_ranges: list[tuple[int, int]] = []
 
         for seq in prefill_seqs:
             remaining_len = len(seq.prompt_token_ids) - seq.computed_len
@@ -135,7 +135,7 @@ class StepExecutor:
         qo_indptr = torch.tensor(qo_indptr_list, dtype=torch.int32, device=device)
 
         kv_indptr_list = [0]
-        kv_indices_list: List[int] = []
+        kv_indices_list: list[int] = []
         for blocks in blocks_per_seq:
             kv_indices_list.extend(blocks)
             kv_indptr_list.append(len(kv_indices_list))
@@ -166,7 +166,7 @@ class StepExecutor:
 
         out = self.model(input_ids=input_ids, position_ids=position_ids, use_cache=False)
 
-        outputs: List[Tuple[Sequence, str]] = []
+        outputs: list[tuple[Sequence, str]] = []
 
         for i, seq in enumerate(active_seqs):
             seq.computed_len = new_computed_lens[i]
@@ -196,14 +196,14 @@ class StepExecutor:
 
         return outputs
 
-    def _run_decode(self, decode_seqs: List[Sequence]) -> List[Tuple[Sequence, str]]:
+    def _run_decode(self, decode_seqs: list[Sequence]) -> list[tuple[Sequence, str]]:
             current_decode_batch_size = len(decode_seqs)
             for seq in decode_seqs:
                 seq.request.metrics.record_decode_step(current_decode_batch_size)
 
             kv_indptr_list = [0]
-            kv_indices_list: List[int] = []
-            kv_last_page_len_list: List[int] = []
+            kv_indices_list: list[int] = []
+            kv_last_page_len_list: list[int] = []
 
             for seq in decode_seqs:
                 kv_indices_list.extend(seq.block_table)
@@ -248,7 +248,7 @@ class StepExecutor:
             next_tokens = self._sample(out.logits[:, -1, :], decode_seqs)
 
 
-            outputs: List[Tuple[Sequence, str]] = []
+            outputs: list[tuple[Sequence, str]] = []
             for i, seq in enumerate(decode_seqs):
                 seq.generated_token_ids.append(next_tokens[i])
 

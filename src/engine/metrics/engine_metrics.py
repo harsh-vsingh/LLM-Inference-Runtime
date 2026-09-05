@@ -1,7 +1,7 @@
 import time
-from collections import deque
-from dataclasses import dataclass, field
-from typing import Deque, Dict
+from dataclasses import dataclass
+
+from engine.metrics.windowed import RateCounter, TimeWindowedStats
 
 
 @dataclass
@@ -12,33 +12,48 @@ class FinishedRequestSample:
 
 
 class EngineMetrics:
-    def __init__(self, recent_window: int = 128):
+
+    def __init__(self, latency_window_s: float = 60.0):
         self.start_time = time.time()
+
         self.total_prompt_tokens = 0
         self.cached_prompt_tokens = 0
         self.total_generated_tokens = 0
-        self._recent: Deque[FinishedRequestSample] = deque(maxlen=recent_window)
-        self._interval_prefill_time = 0.0
-        self._interval_decode_time = 0.0
-        self._interval_steps = 0
-        self._last_tokens_snapshot = 0
-        self._last_report_time = time.time()
-        self.current_tokens_per_second = 0.0
+
         self.total_requests_admitted = 0
         self.total_requests_rejected = 0
         self.total_preemptions = 0
+
+        self._throughput = RateCounter(min_interval_s=0.2)
+
+        self._ttft = TimeWindowedStats(window_s=latency_window_s)
+        self._tpot = TimeWindowedStats(window_s=latency_window_s)
+        self._prefill_step_ms = TimeWindowedStats(window_s=latency_window_s)
+        self._decode_step_ms = TimeWindowedStats(window_s=latency_window_s)
+
+        self.current_decode_batch_size: int = 0
+
+        self._last_log_time = time.time()
 
     def record_prompt(self, prompt_tokens: int, cached_tokens: int) -> None:
         self.total_prompt_tokens += prompt_tokens
         self.cached_prompt_tokens += cached_tokens
 
-    def record_step(self, duration: float, is_prefill: bool, tokens_out: int) -> None:
+    def record_step(
+        self,
+        duration: float,
+        is_prefill: bool,
+        tokens_out: int,
+        decode_batch_size: int = 0,
+    ) -> None:
         if is_prefill:
-            self._interval_prefill_time += duration
+            self._prefill_step_ms.add(duration * 1000)
         else:
-            self._interval_decode_time += duration
-        self._interval_steps += 1
+            self._decode_step_ms.add(duration * 1000)
+            self.current_decode_batch_size = decode_batch_size
+
         self.total_generated_tokens += tokens_out
+        self._throughput.add(tokens_out)
 
     def record_admitted(self) -> None:
         self.total_requests_admitted += 1
@@ -50,34 +65,22 @@ class EngineMetrics:
         self.total_preemptions += 1
 
     def record_finished_request(self, ttft: float, tpot: float, throughput: float) -> None:
-        self._recent.append(
-            FinishedRequestSample(ttft_ms=ttft * 1000, tpot_ms=tpot * 1000, throughput_tps=throughput)
-        )
+        self._ttft.add(ttft * 1000)
+        self._tpot.add(tpot * 1000)
 
-    def flush_interval(self) -> Dict[str, float]:
-        
-        avg_prefill_ms = (
-            (self._interval_prefill_time / self._interval_steps) * 1000
-            if self._interval_steps > 0 else 0.0
-        )
-        avg_decode_ms = (
-            (self._interval_decode_time / self._interval_steps) * 1000
-            if self._interval_steps > 0 else 0.0
-        )
 
-        self._interval_prefill_time = 0.0
-        self._interval_decode_time = 0.0
-        self._interval_steps = 0
+    def flush_interval(self) -> dict[str, float]:
+        """
+        Called periodically by the background logger.
+        """
+        return {
+            "avg_prefill_ms": self._prefill_step_ms.mean(),
+            "avg_decode_ms": self._decode_step_ms.mean(),
+        }
 
-        now = time.time()
-        dt = max(now - self._last_report_time, 1e-6)
-        generated_since_last = self.total_generated_tokens - self._last_tokens_snapshot
-        self.current_tokens_per_second = generated_since_last / dt
-
-        self._last_tokens_snapshot = self.total_generated_tokens
-        self._last_report_time = now
-
-        return {"avg_prefill_ms": avg_prefill_ms, "avg_decode_ms": avg_decode_ms}
+    @property
+    def current_tokens_per_second(self) -> float:
+        return self._throughput.rate()
 
     @property
     def cache_hit_rate_pct(self) -> float:
@@ -87,15 +90,23 @@ class EngineMetrics:
 
     @property
     def avg_ttft_ms(self) -> float:
-        if not self._recent:
-            return 0.0
-        return sum(s.ttft_ms for s in self._recent) / len(self._recent)
+        return self._ttft.mean()
 
     @property
     def avg_tpot_ms(self) -> float:
-        if not self._recent:
-            return 0.0
-        return sum(s.tpot_ms for s in self._recent) / len(self._recent)
+        return self._tpot.mean()
+
+    def latency_summary(self) -> dict[str, dict]:
+        return {
+            "ttft_ms": self._ttft.summary(),
+            "tpot_ms": self._tpot.summary(),
+        }
+
+    def step_time_summary(self) -> dict[str, dict]:
+        return {
+            "prefill_ms": self._prefill_step_ms.summary(),
+            "decode_ms": self._decode_step_ms.summary(),
+        }
 
     @property
     def uptime_seconds(self) -> float:

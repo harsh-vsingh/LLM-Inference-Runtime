@@ -2,7 +2,6 @@ import asyncio
 import logging
 import math
 import time
-from typing import Optional
 
 from engine.memory.allocator import BlockAllocator
 from engine.memory.radix_cache import RadixCache
@@ -33,7 +32,7 @@ class ProcessLoop:
 
         self.wakeup_event = asyncio.Event()
         self._stopping = False
-        self._task: Optional[asyncio.Task] = None
+        self._task: asyncio.Task | None = None
 
     def start(self) -> asyncio.Task:
         self._task = asyncio.create_task(self._run())
@@ -49,7 +48,7 @@ class ProcessLoop:
         self._task.cancel()
         try:
             await asyncio.wait_for(self._task, timeout=timeout)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
+        except (TimeoutError, asyncio.CancelledError):
             pass
 
     async def _run(self) -> None:
@@ -58,7 +57,7 @@ class ProcessLoop:
                 await self.wakeup_event.wait()
 
                 while self.scheduler.has_unfinished_sequences():
-                    if self._stopping and not self.scheduler.running:
+                    if self._stopping and not self.scheduler.has_unfinished_sequences():
                         break
 
                     await self._expire_timed_out_waiting()
@@ -95,20 +94,11 @@ class ProcessLoop:
     async def _run_one_step(self, now: float) -> None:
         prefill_seqs, prefill_chunk_lens, decode_seqs, preempted = self.scheduler.step()
 
-        # Preemption already happened synchronously inside scheduler.step()
-        # (on the event loop, before any worker-thread dispatch) - handle
-        # it here rather than waiting for run_step's result, since
-        # StepExecutor no longer preempts anything itself.
         for seq in preempted:
             if seq.request.is_aborted:
                 # Preemption retry budget was exhausted - AdmissionController
                 # ._fail_preempted_sequence already did all teardown
-                # (decref, list removal, detokenizer drop, aborted-request
-                # metric) synchronously inside scheduler.step(). All that's
-                # left is calling finish() on the request, since nothing
-                # else will ever call it - without this, the client's
-                # output stream would hang forever waiting for a sentinel
-                # that never arrives.
+                # need to do the actual finish call here
                 await seq.request.finish()
 
         try:
@@ -122,13 +112,9 @@ class ProcessLoop:
             step_duration = time.time() - step_start
 
             self.engine_metrics.record_step(
-                step_duration, result.is_prefill, len(result.outputs)
+                step_duration, result.is_prefill, len(result.outputs), decode_batch_size=len(decode_seqs)
             )
 
-            # StepExecutor can't touch radix_cache itself (worker thread) -
-            # it just reports which sequences finished their prefill this
-            # step, and we insert them into the cache here, back on the
-            # event loop.
             for seq, prompt_token_ids, blocks in result.finished_prefills:
                 self.radix_cache.insert(prompt_token_ids, blocks)
 
@@ -146,16 +132,9 @@ class ProcessLoop:
             await asyncio.sleep(0.1)
 
     async def _finish_sequence(self, seq: Sequence) -> None:
-        # Status/list-membership bookkeeping happens here, immediately
-        # alongside resource teardown, rather than being left for
-        # AdmissionController.step()'s cleanup pass on the *next* step.
-        # Deferring it left a window - after this function tears down
-        # block_table/radix-cache state but before the next step() call -
-        # where seq sat in self.scheduler.running fully torn down (empty
-        # block_table, already cache-inserted) yet still nominally
-        # RUNNING. Anything reading `running` in that window (metrics
-        # snapshots from a concurrent get_metrics() call, a future
-        # preemption/eviction algorithm) would see a phantom sequence.
+        """
+        Handles the book-keeping and teardown
+        """
         seq.status = SequenceStatus.FINISHED
         if seq in self.scheduler.running:
             self.scheduler.running.remove(seq)

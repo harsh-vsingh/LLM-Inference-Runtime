@@ -3,7 +3,7 @@ Prefix-cache lookup helper shared by initial admission and preemption
 requeueing.
 """
 
-from typing import List, Tuple
+
 from engine.memory.allocator import BlockAllocator
 from engine.memory.radix_cache import RadixCache
 
@@ -11,8 +11,8 @@ from engine.memory.radix_cache import RadixCache
 def match_prefix_for_new_run(
     radix_cache: RadixCache,
     allocator: BlockAllocator,
-    token_ids: List[int],
-) -> Tuple[List[int], List[int]]:
+    token_ids: list[int],
+) -> tuple[list[int], list[int]]:
     """
     Looks up the cached prefix for `token_ids` and returns
     (matched_tokens, matched_blocks)guaranteeing at least 

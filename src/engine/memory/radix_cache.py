@@ -4,18 +4,18 @@ match_prefix() increfs the matched blocks.
 """
 
 import time
-from typing import Dict, List, Optional, Tuple
+
 from engine.memory.allocator import BlockAllocator
 
 
 class RadixNode:
-    __slots__ = ("children", "block_id", "parent", "chunk", "last_access_time")
+    __slots__ = ("block_id", "children", "chunk", "last_access_time", "parent")
 
     def __init__(self):
-        self.children: Dict[Tuple[int, ...], "RadixNode"] = {}
+        self.children: dict[tuple[int, ...], RadixNode] = {}
         self.block_id: int = -1
-        self.parent: Optional["RadixNode"] = None
-        self.chunk: Optional[Tuple[int, ...]] = None
+        self.parent: RadixNode | None = None
+        self.chunk: tuple[int, ...] | None = None
         self.last_access_time: float = time.time()
 
 
@@ -25,14 +25,14 @@ class RadixCache:
         self.block_size = block_size
         self._allocator = allocator
 
-    def match_prefix(self, tokens: List[int]) -> Tuple[List[int], List[int]]:
+    def match_prefix(self, tokens: list[int]) -> tuple[list[int], list[int]]:
         """
         Returns (matched_tokens, matched_blocks) for the longest cached
         prefix of `tokens`. The matched blocks are increfed.
         """
         node = self.root
-        matched_tokens: List[int] = []
-        matched_blocks: List[int] = []
+        matched_tokens: list[int] = []
+        matched_blocks: list[int] = []
 
         for i in range(0, len(tokens), self.block_size):
             chunk = tuple(tokens[i: i + self.block_size])
@@ -57,13 +57,13 @@ class RadixCache:
         """
         self.root = RadixNode()
 
-    def insert(self, tokens: List[int], block_table: List[int]) -> List[int]:
+    def insert(self, tokens: list[int], block_table: list[int]) -> list[int]:
         """
         Inserts `tokens`/`block_table` into the cache tree.
         Newly created cache entries are increfed.
         """
         node = self.root
-        newly_inserted: List[int] = []
+        newly_inserted: list[int] = []
 
         for i, block_id in enumerate(block_table):
             start = i * self.block_size
@@ -87,8 +87,8 @@ class RadixCache:
 
         return newly_inserted
 
-    def _collect_leaf_nodes(self) -> List[RadixNode]:
-        leaves: List[RadixNode] = []
+    def _collect_leaf_nodes(self) -> list[RadixNode]:
+        leaves: list[RadixNode] = []
         stack = list(self.root.children.values())
 
         while stack:
@@ -101,7 +101,7 @@ class RadixCache:
 
         return leaves
 
-    def evict_lru(self, num_blocks: int) -> List[int]:
+    def evict_lru(self, num_blocks: int) -> list[int]:
         """
         Evicts up to num_blocks lru blocks from the
         cache tree and decrefs them on the allocator. Only 
@@ -115,7 +115,7 @@ class RadixCache:
             return []
 
         leaves.sort(key=lambda n: n.last_access_time)
-        evicted: List[int] = []
+        evicted: list[int] = []
         ref_counts = self._allocator.ref_counts
 
         for leaf in leaves:

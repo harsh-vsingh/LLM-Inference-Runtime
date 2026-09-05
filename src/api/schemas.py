@@ -1,6 +1,8 @@
-from pydantic import BaseModel, Field, field_validator
-from typing import List, Optional, Literal
 import time
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator
+
 
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"]
@@ -8,15 +10,15 @@ class ChatMessage(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     model: str
-    messages: List[ChatMessage]
-    max_tokens: Optional[int] = Field(default=50, gt=0, le=4096)
-    temperature: Optional[float] = Field(default=0.7, ge=0.0, le=2.0)
-    top_p: Optional[float] = Field(default=1.0, gt=0.0, le=1.0)
-    stream: Optional[bool] = False
+    messages: list[ChatMessage]
+    max_tokens: int | None = Field(default=50, gt=0, le=4096)
+    temperature: float | None = Field(default=0.7, ge=0.0, le=2.0)
+    top_p: float | None = Field(default=1.0, gt=0.0, le=1.0)
+    stream: bool | None = False
 
     @field_validator("messages")
     @classmethod
-    def messages_not_empty(cls, v: List[ChatMessage]) -> List[ChatMessage]:
+    def messages_not_empty(cls, v: list[ChatMessage]) -> list[ChatMessage]:
         if not v:
             raise ValueError("messages must not be empty")
         return v
@@ -24,30 +26,30 @@ class ChatCompletionRequest(BaseModel):
 class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
-    finish_reason: Optional[Literal["stop", "length"]] = None
+    finish_reason: Literal["stop", "length"] | None = None
 
 class ChatCompletionResponse(BaseModel):
     id: str
     object: str = "chat.completion"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
-    choices: List[ChatCompletionResponseChoice]
+    choices: list[ChatCompletionResponseChoice]
 
 class ChatCompletionStreamResponseDelta(BaseModel):
-    role: Optional[Literal["system", "user", "assistant"]] = None
-    content: Optional[str] = None
+    role: Literal["system", "user", "assistant"] | None = None
+    content: str | None = None
 
 class ChatCompletionStreamResponseChoice(BaseModel):
     index: int
     delta: ChatCompletionStreamResponseDelta
-    finish_reason: Optional[Literal["stop", "length"]] = None
+    finish_reason: Literal["stop", "length"] | None = None
 
 class ChatCompletionStreamResponse(BaseModel):
     id: str
     object: str = "chat.completion.chunk"
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
-    choices: List[ChatCompletionStreamResponseChoice]
+    choices: list[ChatCompletionStreamResponseChoice]
 
 
 class EngineConfigUpdate(BaseModel):

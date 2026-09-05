@@ -1,9 +1,10 @@
-from typing import List
+
 import torch
+
 from engine.sequence import Sequence
 
 
-def sample(logits: torch.Tensor, seqs: List[Sequence]) -> List[int]:
+def sample(logits: torch.Tensor, seqs: list[Sequence]) -> list[int]:
     logits = logits.float()
 
     temps = torch.tensor(

@@ -11,8 +11,9 @@
 * **Context Window Termination**: Inject a `max_model_len` property into `EngineConfig` and add a hard cutoff condition to `sequence.is_finished()` to safely terminate requests before exceeding hardware constraints.
 
 ### Improvements
-* **Advanced Eviction Victim Selection**: Use the existing radix tree to create a smarter eviction victim selection algorithm. Need to weigh in on the exact tradeoffs and algorithms (e.g., evaluating shared prefix depths and block overlaps to minimize overall compute cost).
+* **Different quantisation path**: BNB is very slow. Use some alternative quantisation syste. If writing fused kernels already, better to just get quantised model.
 * **Updated Decode path Fused kernels + CUDA Graphs**: Optimize decode path. Benchmark and potentially add fused kernels and CUDA graphs.
+* **Advanced Eviction Victim Selection**: Use the existing radix tree to create a smarter eviction victim selection algorithm. Need to weigh in on the exact tradeoffs and algorithms (e.g., evaluating shared prefix depths and block overlaps to minimize overall compute cost).
 * **Direct-to-Decode for Full Cache Matches**: Refactor `AdmissionController` to detect 100% prefix matches. Bypass the prefill budget allocation and immediately push the sequence into the `decode_seqs` batch to eliminate compute waste.
 * **Incremental Radix Cache Insertion & Copy-on-Write (CoW)**: Update the memory manager to insert decode blocks into the `RadixCache` continuously during the active generation phase, rather than waiting until the entire sequence finishes in `ProcessLoop._finish_sequence`. 
     * *Partial Blocks*: Introduce a `partial=True` flag to allow sharing of half-filled active decode blocks. 

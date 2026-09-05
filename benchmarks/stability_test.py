@@ -1,10 +1,11 @@
 import asyncio
-import aiohttp
-import time
 import json
 import random
+import time
 from collections import deque
 from dataclasses import dataclass, field
+
+import aiohttp
 
 API_URL = "http://localhost:8000/v1/chat/completions"
 METRICS_URL = "http://localhost:8000/metrics"  # was 8080 - wrong port, fetch_metrics was silently failing every call
@@ -133,8 +134,7 @@ async def fire_request(session: aiohttp.ClientSession, payload: dict, stats: Sta
                 chunk = raw_chunk.decode("utf-8", errors="ignore").strip()
                 if not chunk:
                     continue
-                if chunk.startswith("data: "):
-                    chunk = chunk[6:]
+                chunk = chunk.removeprefix("data: ")
                 if chunk == "[DONE]":
                     break
 

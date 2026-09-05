@@ -3,12 +3,11 @@ import logging
 import os
 import time
 import uuid
-from typing import List, Optional
 
 from engine.config import EngineConfig
 from engine.errors import AdmissionError, AdmissionRejectReason
-from engine.memory.capacity import estimate_num_blocks
 from engine.memory.allocator import BlockAllocator
+from engine.memory.capacity import estimate_num_blocks
 from engine.memory.prefix_match import match_prefix_for_new_run
 from engine.memory.radix_cache import RadixCache
 from engine.metrics.engine_metrics import EngineMetrics
@@ -48,11 +47,10 @@ class AsyncInferenceEngine:
         self.num_kv_heads = model_config.num_key_value_heads
         self.head_dim = model_config.hidden_size // model_config.num_attention_heads
 
-        # num_blocks is hardware-derived, not a fixed constant: it depends
+        # num_blocks is hardware-derived. It depends
         # on how much GPU memory is left after model weights are loaded,
         # which varies by GPU and by model size/quantization. Falls back
-        # to EngineConfig.num_blocks (e.g. on CPU, where free-memory
-        # querying isn't available) rather than failing.
+        # to EngineConfig.num_blocks rather than failing.
         estimated_blocks = estimate_num_blocks(
             device=model.device,
             block_size=self.block_size,
@@ -83,13 +81,6 @@ class AsyncInferenceEngine:
             max_num_batched_tokens=max_num_batched_tokens,
             on_reject=lambda reason: self.metrics.record_rejected(),
             engine_metrics=self.metrics,
-            # drop_detokenizer_fn can't be supplied yet - StepExecutor
-            # doesn't exist until below. This is a plain forward
-            # reference (AdmissionController -> StepExecutor, one
-            # direction only), not the circular dependency that used to
-            # exist between AdmissionController and BlockAdmission
-            # (which pointed at each other). Assigned once
-            # StepExecutor is constructed.
         )
 
         patch_llama_model(model)
@@ -103,25 +94,13 @@ class AsyncInferenceEngine:
             model=self.model,
             tokenizer=self.tokenizer,
             block_size=self.block_size,
-            # Captured by value at construction time. max_chunk_size is not
-            # in EngineConfig._LEGACY_KEY_MAP (unlike enable_prefix_cache /
-            # enable_chunked_prefill), so admin_service.update_config()
-            # cannot change it - StepExecutor would not see a later change
-            # to self.config.max_chunk_size even if the key were added,
-            # since chunk-size-dependent buffers are sized once at init.
             max_chunk_size=self.config.max_chunk_size,
             num_qo_heads=self.num_qo_heads,
             num_kv_heads=self.num_kv_heads,
             head_dim=self.head_dim,
             sampler=sample,
         )
-        # StepExecutor is pure compute now: no allocator/radix_cache
-        # reference, no allocation/eviction/preemption of any kind. All
-        # of that lives in AdmissionController (see step()), which is
-        # the only thing that runs before the asyncio.to_thread hop in
-        # ProcessLoop. This single assignment is the only wiring left
-        # between the two - AdmissionController needs to know how to
-        # drop a detokenizer when it preempts or hard-fails a sequence.
+
         self.scheduler._drop_detokenizer_fn = self._step_executor.drop_detokenizer
 
         self._process_loop = ProcessLoop(
@@ -133,7 +112,7 @@ class AsyncInferenceEngine:
             block_size=self.block_size,
         )
 
-        self._metrics_task: Optional[asyncio.Task] = None
+        self._metrics_task: asyncio.Task | None = None
 
     def start(self) -> None:
         self._process_loop.start()
@@ -155,24 +134,15 @@ class AsyncInferenceEngine:
             eos_token_id=self.tokenizer.eos_token_id,
         )
 
-        # Admission is checked BEFORE any prefix-cache lookup. match_prefix
-        # increfs the blocks it matches (see radix_cache.py) - if admission
-        # then rejected this request, those references would never be
-        # released (the sequence is discarded, nothing left to decref
-        # them), permanently leaking blocks. Checking first avoids ever
-        # touching the cache for a request that won't be admitted.
-        #
         # NOTE: seq sits in `waiting` briefly below with an empty
         # block_table before being fully initialized. Safe only because
         # there is no `await` between add_sequence() and the block_table
-        # assignment - nothing can interleave and observe the
-        # half-initialized sequence under Python's cooperative async
-        # model. Do not insert an await in this span without reconsidering
-        # this ordering.
+        # assignment. Do not insert an await in this span without 
+        # reconsidering this ordering.
         self.scheduler.add_sequence(seq)
 
-        matched_tokens: List[int] = []
-        matched_blocks: List[int] = []
+        matched_tokens: list[int] = []
+        matched_blocks: list[int] = []
 
         if self.config.enable_prefix_cache:
             matched_tokens, matched_blocks = match_prefix_for_new_run(
@@ -221,7 +191,7 @@ class AsyncInferenceEngine:
             self._metrics_task.cancel()
             try:
                 await asyncio.wait_for(self._metrics_task, timeout=5.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
+            except (TimeoutError, asyncio.CancelledError):
                 pass
 
         logger.info("engine shutdown complete")

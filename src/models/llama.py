@@ -1,39 +1,36 @@
-import torch
-import torch.nn as nn
+from typing import cast
+
 import flashinfer
-from typing import Optional, Tuple, cast
+import torch
+from torch import nn
 from transformers.models.llama.modeling_llama import LlamaAttention
 
 try:
     import bitsandbytes as bnb
-    from bitsandbytes.nn import Linear4bit, Params4bit
     from bitsandbytes.functional import dequantize_4bit
+    from bitsandbytes.nn import Linear4bit, Params4bit
     _BNB_AVAILABLE = True
 except ImportError:
     _BNB_AVAILABLE = False
 
 class FlashInferState:
-    kv_pool: Optional[torch.Tensor] = None
+    kv_pool: torch.Tensor | None = None
 
-    kv_indices: Optional[torch.Tensor] = None
-    kv_indptr: Optional[torch.Tensor] = None
-    kv_last_page_len: Optional[torch.Tensor] = None
+    kv_indices: torch.Tensor | None = None
+    kv_indptr: torch.Tensor | None = None
+    kv_last_page_len: torch.Tensor | None = None
 
-    batch_indices: Optional[torch.Tensor] = None
-    positions: Optional[torch.Tensor] = None
+    batch_indices: torch.Tensor | None = None
+    positions: torch.Tensor | None = None
 
-    workspace_buffer: Optional[torch.Tensor] = None
+    workspace_buffer: torch.Tensor | None = None
 
-    prefill_wrapper: Optional[
-        flashinfer.BatchPrefillWithPagedKVCacheWrapper
-    ] = None
+    prefill_wrapper: flashinfer.BatchPrefillWithPagedKVCacheWrapper | None = None
 
-    decode_wrapper: Optional[
-        flashinfer.BatchDecodeWithPagedKVCacheWrapper
-    ] = None
+    decode_wrapper: flashinfer.BatchDecodeWithPagedKVCacheWrapper | None = None
 
     page_size: int = 16
-    dtype: Optional[torch.dtype] = None
+    dtype: torch.dtype | None = None
 
 
     mode: str = "prefill"
@@ -153,7 +150,7 @@ def plan_decode(
 def patched_llama_attention_forward(
     self,
     hidden_states: torch.Tensor,
-    position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
     attention_mask=None,
     past_key_value=None,
     output_attentions=False,
@@ -163,24 +160,18 @@ def patched_llama_attention_forward(
 ):
     bsz, q_len, _ = hidden_states.shape
 
-    # Fused QKV projection: one GEMM launch instead of three.
     qkv = self.qkv_proj(hidden_states)
     q, k, v = qkv.split(
         [self.q_size, self.kv_size, self.kv_size],
         dim=-1,
     )
 
-    # Flatten straight to (nnz, heads, head_dim) — no (b, h, s, d) transpose
-    # needed since RoPE is applied in this layout directly below.
     q_flat = q.view(-1, self.num_heads, self.head_dim)
     k_flat = k.view(-1, self.num_key_value_heads, self.head_dim)
     v_flat = v.view(-1, self.num_key_value_heads, self.head_dim)
 
     positions = cast(torch.Tensor, FlashInferState.positions)
 
-    # Fused RoPE kernel: computes cos/sin internally and rotates q/k
-    # in place, operating on the same ragged (nnz, heads, head_dim)
-    # layout used by the KV-cache append and attention kernels below.
     flashinfer.apply_rope_pos_ids_inplace(
         q_flat,
         k_flat,
@@ -263,8 +254,7 @@ def _is_quantized_4bit(proj: nn.Module) -> bool:
 
 
 def _fuse_qkv_proj_plain(attn: LlamaAttention) -> nn.Linear:
-    """Build a single nn.Linear from plain-precision q_proj/k_proj/v_proj
-    weights, so the forward pass does one GEMM instead of three.
+    """Build a single nn.Linear from plain-precision
     """
     q_proj, k_proj, v_proj = attn.q_proj, attn.k_proj, attn.v_proj
 
@@ -292,16 +282,6 @@ def _fuse_qkv_proj_plain(attn: LlamaAttention) -> nn.Linear:
 
 def _fuse_qkv_proj_4bit(attn: LlamaAttention) -> "Linear4bit":
     """Build a single Linear4bit from quantized q_proj/k_proj/v_proj.
-
-    Params4bit stores packed nibbles plus a per-block QuantState (scales /
-    zero-points); packed bytes from three separately-quantized layers can't
-    be concatenated directly, and the QuantStates wouldn't line up if we
-    tried. So each projection is dequantized back to float first, the
-    floats are concatenated, and the result is re-quantized once as a new
-    Linear4bit — matching the original layers' quant_type,
-    compress_statistics, and quant_storage rather than hardcoding
-    bitsandbytes defaults, so this stays in sync with whatever
-    BitsAndBytesConfig loader.py used.
     """
     assert _BNB_AVAILABLE, "bitsandbytes not installed but q_proj is Linear4bit"
 
@@ -344,9 +324,6 @@ def _fuse_qkv_proj_4bit(attn: LlamaAttention) -> "Linear4bit":
         device="meta",
     )
 
-    # Assign the concatenated float weight as a fresh Params4bit; moving it
-    # to the target device triggers quantization (mirrors the documented
-    # bitsandbytes pattern: build in float, then .to(device) to quantize).
     fused.weight = Params4bit(
         data=fused_weight_fp,
         requires_grad=False,
@@ -371,11 +348,6 @@ def patch_llama_model(model):
 
     if rope_scaling is not None:
         rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
-        # "default"/None: standard unscaled RoPE, same as no rope_scaling at
-        # all. "linear": supported via rope_scale factor. Anything else
-        # (dynamic/NTK, yarn, longrope, llama3) rescales frequencies or
-        # applies non-linear adjustments apply_rope_pos_ids_inplace can't
-        # reproduce, so positions would silently come out wrong.
         if rope_type not in (None, "default", "linear"):
             raise NotImplementedError(
                 f"model.config.rope_scaling type '{rope_type}' is not "

@@ -1,6 +1,7 @@
-from fastapi import Request, Depends
-from services.engine_registry import EngineRegistry
+from fastapi import Depends, Request
+
 from engine.async_engine import AsyncInferenceEngine
+from services.engine_registry import EngineRegistry
 
 
 def get_engine_registry(request: Request) -> EngineRegistry:

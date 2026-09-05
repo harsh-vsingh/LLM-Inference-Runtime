@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from typing import Optional
 
 from core.config import settings
 from engine.async_engine import AsyncInferenceEngine
@@ -13,9 +12,9 @@ class EngineRegistry:
     def __init__(self, model_name: str, use_quantization: bool = settings.use_quantization):
         self._model_name = model_name
         self._use_quantization = use_quantization
-        self._engine: Optional[AsyncInferenceEngine] = None
+        self._engine: AsyncInferenceEngine | None = None
         self._shutdown_signal_installed = False
-        self._shutdown_event: Optional[asyncio.Event] = None
+        self._shutdown_event: asyncio.Event | None = None
 
     def load(self) -> None:
         """Load the model and start the engine. Call once, at startup."""
@@ -55,7 +54,6 @@ class EngineRegistry:
             "install_signal_handlers() is a no-op - call engine_registry.shutdown() "
             "from the FastAPI lifespan teardown (after `yield`) instead."
         )
-        return
 
     async def shutdown(self, timeout: float = 30.0) -> None:
         if self._engine is not None:

@@ -4,7 +4,7 @@ stream through the scheduler/engine).
 """
 
 from enum import Enum
-from typing import List
+
 from engine.request import InferenceRequest
 
 
@@ -18,17 +18,17 @@ class Sequence:
     def __init__(
         self,
         request: InferenceRequest,
-        prompt_token_ids: List[int],
+        prompt_token_ids: list[int],
         eos_token_id: int,
     ):
         self.request = request
         self.prompt_token_ids = prompt_token_ids
         self.original_prompt_len = len(prompt_token_ids)
-        self.generated_token_ids: List[int] = []
+        self.generated_token_ids: list[int] = []
         self.eos_token_id = eos_token_id
 
         self.status = SequenceStatus.WAITING
-        self.block_table: List[int] = []
+        self.block_table: list[int] = []
 
         self.cached_prefix_len = 0
         self.computed_len = 0
@@ -39,7 +39,7 @@ class Sequence:
         return self.request.metrics.created_at
 
     @property
-    def uncached_token_ids(self) -> List[int]:
+    def uncached_token_ids(self) -> list[int]:
         return self.prompt_token_ids[self.cached_prefix_len:]
 
     @property

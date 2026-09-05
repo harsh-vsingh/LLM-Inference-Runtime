@@ -1,15 +1,16 @@
-import uuid
+import asyncio
 import json
 import time
-import asyncio
-from typing import AsyncGenerator, Dict, Any
+import uuid
+from collections.abc import AsyncGenerator
+from typing import Any
 
 from fastapi import Request
 
 from api.schemas import ChatCompletionRequest
-from engine.request import InferenceRequest
-from engine.async_engine import AsyncInferenceEngine
 from core.logging import get_logger
+from engine.async_engine import AsyncInferenceEngine
+from engine.request import InferenceRequest
 
 logger = get_logger(__name__)
 
@@ -148,7 +149,7 @@ async def stream_chat_completion(
 
 async def aggregate_chat_completion(
     request_id: str, inference_req: InferenceRequest, model_name: str
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Non-streaming path: drain the output queue into one full response."""
     chunks = []
     try:

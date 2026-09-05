@@ -1,6 +1,6 @@
 from api.schemas import EngineConfigUpdate
-from engine.async_engine import AsyncInferenceEngine
 from core.logging import get_logger
+from engine.async_engine import AsyncInferenceEngine
 
 logger = get_logger(__name__)
 
